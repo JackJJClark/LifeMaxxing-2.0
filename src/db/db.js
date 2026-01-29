@@ -14,6 +14,7 @@ const webStore = {
   chestRewards: [],
   combatEncounters: [],
   mercyEvents: [],
+  habitEffortCache: {},
 };
 
 const EFFORT_UNITS_PER_LEVEL = 10;
@@ -139,6 +140,78 @@ async function applyMercyIfEligible(rarity, inactivityDays) {
   return { rarity: boosted, mercyUsed: true, bypassUnlock };
 }
 
+const HABIT_PREVALENCE = [
+  {
+    key: 'exercise',
+    keywords: ['gym', 'lift', 'strength', 'weights', 'workout', 'exercise', 'cardio', 'run', 'cycle'],
+    prevalence: 47.3,
+    source: 'cdc_aerobic_2022',
+  },
+  {
+    key: 'sleep',
+    keywords: ['sleep', 'bed', 'rest'],
+    prevalence: 65.0,
+    source: 'cdc_sleep_2020',
+  },
+  {
+    key: 'water',
+    keywords: ['water', 'hydrate', 'hydration'],
+    prevalence: 81.4,
+    source: 'nhanes_water_2011_2014',
+  },
+  {
+    key: 'meditation',
+    keywords: ['meditate', 'meditation', 'mindfulness'],
+    prevalence: 14.2,
+    source: 'nccih_meditation_2017',
+  },
+  {
+    key: 'yoga',
+    keywords: ['yoga'],
+    prevalence: 14.3,
+    source: 'cdc_yoga_2017',
+  },
+  {
+    key: 'vegetables',
+    keywords: ['vegetable', 'veggies', 'greens', 'salad'],
+    prevalence: 10.0,
+    source: 'cdc_fruit_veg_2019',
+  },
+  {
+    key: 'fruit',
+    keywords: ['fruit', 'berries', 'apple', 'banana'],
+    prevalence: 12.3,
+    source: 'cdc_fruit_veg_2019',
+  },
+];
+
+function normalizeHabitKey(name) {
+  return name.trim().toLowerCase();
+}
+
+function effortFromPrevalence(prevalence) {
+  if (prevalence >= 80) return 1;
+  if (prevalence >= 65) return 2;
+  if (prevalence >= 50) return 3;
+  if (prevalence >= 35) return 4;
+  if (prevalence >= 25) return 5;
+  if (prevalence >= 15) return 6;
+  if (prevalence >= 8) return 7;
+  if (prevalence >= 4) return 8;
+  if (prevalence >= 1) return 9;
+  return 10;
+}
+
+function matchPrevalence(habitName) {
+  const text = normalizeHabitKey(habitName);
+  for (const entry of HABIT_PREVALENCE) {
+    if (entry.keywords.some((keyword) => text.includes(keyword))) {
+      return entry;
+    }
+  }
+  return { prevalence: 30, source: 'default_estimate' };
+}
+
 export async function initDb() {
   if (isWeb) return;
   await execSql('PRAGMA foreign_keys = ON');
@@ -221,6 +294,58 @@ export async function initDb() {
       createdAt TEXT NOT NULL
     )`
   );
+
+  await execSql(
+    `CREATE TABLE IF NOT EXISTS habit_effort_cache (
+      habitKey TEXT PRIMARY KEY NOT NULL,
+      effort INTEGER NOT NULL,
+      prevalence REAL,
+      source TEXT,
+      updatedAt TEXT NOT NULL
+    )`
+  );
+}
+
+export async function getHabitEffortForName(habitName) {
+  const habitKey = normalizeHabitKey(habitName);
+  if (!habitKey) return { effort: 5, prevalence: 30, source: 'default_estimate' };
+
+  if (isWeb) {
+    const cached = webStore.habitEffortCache[habitKey];
+    if (cached) return cached;
+    const matched = matchPrevalence(habitName);
+    const effort = effortFromPrevalence(matched.prevalence);
+    const record = {
+      effort,
+      prevalence: matched.prevalence,
+      source: matched.source,
+      updatedAt: nowIso(),
+    };
+    webStore.habitEffortCache[habitKey] = record;
+    return record;
+  }
+
+  const result = await execSql(
+    'SELECT effort, prevalence, source, updatedAt FROM habit_effort_cache WHERE habitKey = ? LIMIT 1',
+    [habitKey]
+  );
+  if (result.rows.length > 0) {
+    return result.rows.item(0);
+  }
+
+  const matched = matchPrevalence(habitName);
+  const effort = effortFromPrevalence(matched.prevalence);
+  const record = {
+    effort,
+    prevalence: matched.prevalence,
+    source: matched.source,
+    updatedAt: nowIso(),
+  };
+  await execSql(
+    'INSERT INTO habit_effort_cache (habitKey, effort, prevalence, source, updatedAt) VALUES (?, ?, ?, ?, ?)',
+    [habitKey, record.effort, record.prevalence, record.source, record.updatedAt]
+  );
+  return record;
 }
 
 export async function getOrCreateIdentity() {
@@ -343,6 +468,16 @@ export async function setHabitActive(habitId, isActive) {
     return;
   }
   await execSql('UPDATE habits SET isActive = ? WHERE id = ?', [isActive ? 1 : 0, habitId]);
+}
+
+export async function deleteHabit(habitId) {
+  if (isWeb) {
+    webStore.effortLogs = webStore.effortLogs.filter((log) => log.habitId !== habitId);
+    webStore.habits = webStore.habits.filter((habit) => habit.id !== habitId);
+    return;
+  }
+  await execSql('DELETE FROM effort_logs WHERE habitId = ?', [habitId]);
+  await execSql('DELETE FROM habits WHERE id = ?', [habitId]);
 }
 
 async function createItemRecord(item) {

@@ -1,0 +1,74 @@
+import { supabase } from './supabase';
+import { exportAllData, importAllData, clearAllData, touchLastActive } from '../db/db';
+
+const BACKUP_TABLE = 'lifemaxing_backups';
+
+async function requireSession() {
+  if (!supabase) {
+    throw new Error('Supabase is not configured.');
+  }
+  const { data, error } = await supabase.auth.getSession();
+  if (error) {
+    throw error;
+  }
+  if (!data.session) {
+    throw new Error('Not signed in.');
+  }
+  return data.session;
+}
+
+export async function signInWithPassword(email, password) {
+  if (!supabase) {
+    throw new Error('Supabase is not configured.');
+  }
+  const { error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) {
+    throw error;
+  }
+}
+
+export async function signOut() {
+  if (!supabase) {
+    throw new Error('Supabase is not configured.');
+  }
+  const { error } = await supabase.auth.signOut();
+  if (error) {
+    throw error;
+  }
+}
+
+export async function saveBackup() {
+  const session = await requireSession();
+  const payload = await exportAllData();
+  const record = {
+    user_id: session.user.id,
+    payload,
+    updated_at: new Date().toISOString(),
+  };
+  const { error } = await supabase.from(BACKUP_TABLE).upsert(record, {
+    onConflict: 'user_id',
+  });
+  if (error) {
+    throw error;
+  }
+  return record;
+}
+
+export async function loadBackup() {
+  const session = await requireSession();
+  const { data, error } = await supabase
+    .from(BACKUP_TABLE)
+    .select('payload, updated_at')
+    .eq('user_id', session.user.id)
+    .single();
+  if (error) {
+    throw error;
+  }
+  if (!data || !data.payload) {
+    throw new Error('No backup found.');
+  }
+  await clearAllData();
+  await importAllData(data.payload);
+  await touchLastActive();
+  return data;
+}
