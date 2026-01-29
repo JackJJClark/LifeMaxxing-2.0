@@ -17,6 +17,11 @@ async function requireSession() {
   return data.session;
 }
 
+async function requireAdminSession() {
+  const session = await requireSession();
+  return session;
+}
+
 export async function signInWithPassword(email, password) {
   if (!supabase) {
     throw new Error('Supabase is not configured.');
@@ -67,6 +72,48 @@ export async function loadBackup() {
   if (!data || !data.payload) {
     throw new Error('No backup found.');
   }
+  await clearAllData();
+  await importAllData(data.payload);
+  await touchLastActive();
+  return data;
+}
+
+export async function listBackups({ limit = 50, userId = null } = {}) {
+  await requireAdminSession();
+  let query = supabase
+    .from(BACKUP_TABLE)
+    .select('user_id, updated_at')
+    .order('updated_at', { ascending: false })
+    .limit(limit);
+  if (userId) {
+    query = query.eq('user_id', userId);
+  }
+  const { data, error } = await query;
+  if (error) {
+    throw error;
+  }
+  return data || [];
+}
+
+export async function fetchBackupForUserId(userId) {
+  if (!userId) throw new Error('User id required.');
+  await requireAdminSession();
+  const { data, error } = await supabase
+    .from(BACKUP_TABLE)
+    .select('payload, updated_at')
+    .eq('user_id', userId)
+    .single();
+  if (error) {
+    throw error;
+  }
+  if (!data || !data.payload) {
+    throw new Error('No backup found.');
+  }
+  return data;
+}
+
+export async function loadBackupForUserId(userId) {
+  const data = await fetchBackupForUserId(userId);
   await clearAllData();
   await importAllData(data.payload);
   await touchLastActive();

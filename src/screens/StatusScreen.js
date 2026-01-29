@@ -1,5 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
-import { StyleSheet, Text, View, Pressable, TextInput, ScrollView } from 'react-native';
+import { StyleSheet, Text, View, Pressable, TextInput, ScrollView, Platform } from 'react-native';
+import { ADMIN_EMAILS, isAdminEmail } from '../config';
+import { supabase } from '../services/supabase';
+import {
+  signInWithPassword,
+  signOut,
+  saveBackup,
+  loadBackup,
+  listBackups,
+  fetchBackupForUserId,
+  loadBackupForUserId,
+} from '../services/backup';
 import {
   createHabit,
   createCombatEncounter,
@@ -25,7 +36,7 @@ import {
 
 export default function StatusScreen() {
   const SHOW_TRUST_TESTS = true;
-  const NAV_TABS = [
+  const BASE_TABS = [
     'Tasks',
     'Inventory',
     'Shops',
@@ -42,7 +53,7 @@ export default function StatusScreen() {
   const [lastAction, setLastAction] = useState('');
   const [inactivityDays, setInactivityDays] = useState(0);
   const [newHabitName, setNewHabitName] = useState('');
-  const [effortNote] = useState('');
+  const [effortNote, setEffortNote] = useState('');
   const [chests, setChests] = useState([]);
   const [items, setItems] = useState([]);
   const [efforts, setEfforts] = useState([]);
@@ -54,7 +65,28 @@ export default function StatusScreen() {
   const [combatMessage, setCombatMessage] = useState('');
   const [mercyStatus, setMercyStatus] = useState(null);
   const [accountMessage, setAccountMessage] = useState('');
+  const [showLoginForm, setShowLoginForm] = useState(false);
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [adminStatus, setAdminStatus] = useState('unknown');
+  const [adminEmail, setAdminEmail] = useState('');
+  const [adminMessage, setAdminMessage] = useState('');
+  const [adminBusy, setAdminBusy] = useState(false);
+  const [adminBackups, setAdminBackups] = useState([]);
+  const [adminFilter, setAdminFilter] = useState('');
+  const [adminSelectedUserId, setAdminSelectedUserId] = useState('');
+  const [adminSummary, setAdminSummary] = useState(null);
+  const [adminLoading, setAdminLoading] = useState(false);
+  const [adminLog, setAdminLog] = useState([]);
   const [activeTab, setActiveTab] = useState('Tasks');
+
+  const adminEnabled = ADMIN_EMAILS.length > 0;
+  const showAdminTab = Platform.OS === 'web';
+  const navTabs = useMemo(() => {
+    const tabs = [...BASE_TABS];
+    if (showAdminTab) tabs.push('Admin');
+    return tabs;
+  }, [showAdminTab]);
 
   async function refresh() {
     const snap = await getStatusSnapshot();
@@ -95,6 +127,29 @@ export default function StatusScreen() {
     }
   }
 
+  async function refreshAuthStatus() {
+    if (!supabase || !adminEnabled) {
+      setAdminStatus('disabled');
+      return;
+    }
+    const { data } = await supabase.auth.getSession();
+    if (!data.session) {
+      setAdminStatus('signed_out');
+      setAdminEmail('');
+      return;
+    }
+    const sessionEmail = data.session.user?.email || '';
+    if (!isAdminEmail(sessionEmail)) {
+      await supabase.auth.signOut();
+      setAdminStatus('signed_out');
+      setAdminEmail('');
+      setAdminMessage('Admin access only.');
+      return;
+    }
+    setAdminStatus('signed_in');
+    setAdminEmail(sessionEmail);
+  }
+
   useEffect(() => {
     let alive = true;
     async function bootstrap() {
@@ -103,6 +158,7 @@ export default function StatusScreen() {
       await touchLastActive();
       if (!alive) return;
       await refresh();
+      await refreshAuthStatus();
       setLoading(false);
     }
 
@@ -112,6 +168,27 @@ export default function StatusScreen() {
     };
   }, []);
 
+  useEffect(() => {
+    if (Platform.OS !== 'web') return;
+    try {
+      const stored = window.localStorage.getItem('lifemaxing.activeTab');
+      if (stored) {
+        setActiveTab(stored);
+      }
+    } catch (error) {
+      // Ignore storage errors.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web') return;
+    try {
+      window.localStorage.setItem('lifemaxing.activeTab', activeTab);
+    } catch (error) {
+      // Ignore storage errors.
+    }
+  }, [activeTab]);
+
   const selectedHabit = useMemo(
     () => habits.find((habit) => habit.id === habitId) || null,
     [habits, habitId]
@@ -120,6 +197,7 @@ export default function StatusScreen() {
   useEffect(() => {
     refresh();
   }, [effortFilter]);
+
 
   useEffect(() => {
     let alive = true;
@@ -137,11 +215,17 @@ export default function StatusScreen() {
     };
   }, [selectedHabit?.name]);
 
+  useEffect(() => {
+    if (showAdminTab && activeTab === 'Admin' && adminBackups.length === 0) {
+      handleRefreshBackups();
+    }
+  }, [showAdminTab, activeTab]);
+
   const isQuietMode = inactivityDays >= 3;
 
   async function handleLogEffort(customHabitId, customHabitName) {
-    if (!habitId) return;
     const targetHabitId = customHabitId || habitId;
+    if (!targetHabitId) return;
     const targetHabit = customHabitName
       ? { name: customHabitName, isActive: true }
       : selectedHabit;
@@ -183,6 +267,197 @@ export default function StatusScreen() {
       setCombatMessage('No downside. Rewards remain locked.');
     }
     await refresh();
+  }
+
+  async function handleAccountSignIn() {
+    if (!adminEnabled) {
+      setAccountMessage('Account linking is not enabled.');
+      return;
+    }
+    if (!isAdminEmail(loginEmail)) {
+      setAccountMessage('Admin access only.');
+      return;
+    }
+    setAdminBusy(true);
+    setAccountMessage('');
+    setAdminMessage('');
+    try {
+      await signInWithPassword(loginEmail.trim(), loginPassword);
+      await refreshAuthStatus();
+      setAccountMessage('Signed in.');
+      setAdminLog((prev) => [
+        { label: 'Signed in', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+      setShowLoginForm(false);
+      setLoginPassword('');
+      setAdminBackups([]);
+      setAdminSelectedUserId('');
+      setAdminSummary(null);
+    } catch (error) {
+      setAccountMessage(error?.message || 'Sign in failed.');
+    } finally {
+      setAdminBusy(false);
+    }
+  }
+
+  async function handleAccountSignOut() {
+    setAdminBusy(true);
+    setAccountMessage('');
+    setAdminMessage('');
+    try {
+      await signOut();
+      await refreshAuthStatus();
+      setAccountMessage('Signed out.');
+      setAdminLog((prev) => [
+        { label: 'Signed out', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+      setAdminBackups([]);
+      setAdminSelectedUserId('');
+      setAdminSummary(null);
+    } catch (error) {
+      setAccountMessage(error?.message || 'Sign out failed.');
+    } finally {
+      setAdminBusy(false);
+    }
+  }
+
+  async function handleSaveBackup() {
+    setAdminBusy(true);
+    setAdminMessage('');
+    try {
+      const record = await saveBackup();
+      setAdminMessage(`Backup saved (${new Date(record.updated_at).toLocaleString()}).`);
+      setAdminLog((prev) => [
+        { label: 'Saved backup (self)', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+    } catch (error) {
+      setAdminMessage(error?.message || 'Backup failed.');
+    } finally {
+      setAdminBusy(false);
+    }
+  }
+
+  async function handleLoadBackup() {
+    setAdminBusy(true);
+    setAdminMessage('');
+    try {
+      const record = await loadBackup();
+      await refresh();
+      setAdminMessage(`Backup loaded (${new Date(record.updated_at).toLocaleString()}).`);
+      setAdminLog((prev) => [
+        { label: 'Loaded backup (self)', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+    } catch (error) {
+      setAdminMessage(error?.message || 'Load failed.');
+    } finally {
+      setAdminBusy(false);
+    }
+  }
+
+  async function handleRefreshBackups() {
+    setAdminLoading(true);
+    setAdminMessage('');
+    try {
+      const list = await listBackups({
+        limit: 50,
+        userId: adminFilter.trim() || null,
+      });
+      setAdminBackups(list);
+      if (list.length === 0) {
+        setAdminMessage('No backups found.');
+      }
+      setAdminLog((prev) => [
+        { label: 'Refreshed backup list', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+    } catch (error) {
+      setAdminMessage(error?.message || 'Failed to load backups.');
+    } finally {
+      setAdminLoading(false);
+    }
+  }
+
+  async function handlePreviewBackup() {
+    if (!adminSelectedUserId) return;
+    setAdminLoading(true);
+    setAdminMessage('');
+    try {
+      const data = await fetchBackupForUserId(adminSelectedUserId);
+      const payload = data.payload || {};
+      const payloadBytes = JSON.stringify(payload).length;
+      setAdminSummary({
+        updatedAt: data.updated_at,
+        identityLevel: payload.identity?.level || 0,
+        totalEffort: payload.identity?.totalEffortUnits || 0,
+        habits: payload.habits?.length || 0,
+        efforts: payload.effortLogs?.length || 0,
+        chests: payload.chests?.length || 0,
+        items: payload.items?.length || 0,
+        payloadBytes,
+      });
+      setAdminLog((prev) => [
+        { label: 'Previewed backup', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+    } catch (error) {
+      setAdminMessage(error?.message || 'Preview failed.');
+    } finally {
+      setAdminLoading(false);
+    }
+  }
+
+  async function handleLoadBackupForUser() {
+    if (!adminSelectedUserId) return;
+    setAdminLoading(true);
+    setAdminMessage('');
+    try {
+      const record = await loadBackupForUserId(adminSelectedUserId);
+      await refresh();
+      setAdminMessage(`Loaded backup (${new Date(record.updated_at).toLocaleString()}).`);
+      setAdminLog((prev) => [
+        { label: 'Loaded backup to device', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+    } catch (error) {
+      setAdminMessage(error?.message || 'Load failed.');
+    } finally {
+      setAdminLoading(false);
+    }
+  }
+
+  async function handleExportBackup() {
+    if (!adminSelectedUserId) return;
+    setAdminLoading(true);
+    setAdminMessage('');
+    try {
+      const data = await fetchBackupForUserId(adminSelectedUserId);
+      const payload = data.payload || {};
+      const fileName = `lifemaxing_backup_${adminSelectedUserId}.json`;
+      if (Platform.OS === 'web') {
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = fileName;
+        link.click();
+        URL.revokeObjectURL(url);
+        setAdminMessage('Backup exported.');
+      } else {
+        setAdminMessage('Export is available on web only.');
+      }
+      setAdminLog((prev) => [
+        { label: 'Exported backup JSON', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+    } catch (error) {
+      setAdminMessage(error?.message || 'Export failed.');
+    } finally {
+      setAdminLoading(false);
+    }
   }
 
   function formatHabitName(raw) {
@@ -253,6 +528,7 @@ export default function StatusScreen() {
   const showInventory = activeTab === 'Inventory';
   const showChallenges = activeTab === 'Challenges';
   const showHelp = activeTab === 'Help';
+  const showAdmin = activeTab === 'Admin';
   const showPlaceholder = ['Shops', 'Party', 'Group'].includes(activeTab);
 
   function getHabitTags(name) {
@@ -466,14 +742,194 @@ export default function StatusScreen() {
       {showHelp ? (
         <View style={styles.panel}>
           <Text style={styles.panelTitle}>Account</Text>
-          <Text style={styles.subtle}>Mode: Guest (local-first)</Text>
+          <Text style={styles.subtle}>
+            {adminStatus === 'signed_in'
+              ? `Mode: Admin (${adminEmail || 'signed in'})`
+              : 'Mode: Guest (local-first)'}
+          </Text>
           <Pressable
             style={styles.buttonGhost}
-            onPress={() => setAccountMessage('Account linking is not enabled in this build.')}
+            onPress={() => setShowLoginForm((current) => !current)}
           >
-            <Text style={styles.buttonGhostText}>Link account (placeholder)</Text>
+            <Text style={styles.buttonGhostText}>Link account</Text>
           </Pressable>
+          {showLoginForm ? (
+            <View style={styles.loginPanel}>
+              <TextInput
+                value={loginEmail}
+                onChangeText={setLoginEmail}
+                placeholder="Email"
+                placeholderTextColor="#4b5563"
+                style={styles.input}
+                autoCapitalize="none"
+                keyboardType="email-address"
+              />
+              <TextInput
+                value={loginPassword}
+                onChangeText={setLoginPassword}
+                placeholder="Password"
+                placeholderTextColor="#4b5563"
+                style={styles.input}
+                secureTextEntry
+              />
+              <Pressable
+                style={styles.button}
+                onPress={handleAccountSignIn}
+                disabled={adminBusy}
+              >
+                <Text style={styles.buttonText}>Sign in</Text>
+              </Pressable>
+            </View>
+          ) : null}
+          {adminStatus === 'signed_in' ? (
+            <Pressable
+              style={styles.buttonGhost}
+              onPress={handleAccountSignOut}
+              disabled={adminBusy}
+            >
+              <Text style={styles.buttonGhostText}>Sign out</Text>
+            </Pressable>
+          ) : null}
           {accountMessage ? <Text style={styles.subtle}>{accountMessage}</Text> : null}
+        </View>
+      ) : null}
+
+      {showAdmin ? (
+        <View style={styles.panel}>
+          <Text style={styles.panelTitle}>Admin Dashboard</Text>
+          {adminStatus !== 'signed_in' ? (
+            <Text style={styles.subtle}>Sign in via Help → Link account to access admin tools.</Text>
+          ) : null}
+          <Text style={styles.subtle}>Backups (Supabase)</Text>
+          <View style={styles.habitInputRow}>
+            <TextInput
+              value={adminFilter}
+              onChangeText={setAdminFilter}
+              placeholder="Filter by user id (optional)"
+              placeholderTextColor="#4b5563"
+              style={styles.input}
+              autoCapitalize="none"
+            />
+            <Pressable
+              style={styles.buttonSmall}
+              onPress={handleRefreshBackups}
+              disabled={adminLoading}
+            >
+              <Text style={styles.buttonText}>Refresh</Text>
+            </Pressable>
+          </View>
+          {adminBackups.length === 0 ? (
+            <Text style={styles.subtle}>No backups loaded yet.</Text>
+          ) : (
+            adminBackups.map((backup) => (
+              <Pressable
+                key={backup.user_id}
+                style={[
+                  styles.adminRow,
+                  adminSelectedUserId === backup.user_id && styles.adminRowSelected,
+                ]}
+                onPress={() => {
+                  setAdminSelectedUserId(backup.user_id);
+                  setAdminSummary(null);
+                }}
+              >
+                <View>
+                  <Text style={styles.adminRowTitle}>{backup.user_id}</Text>
+                  <Text style={styles.subtle}>
+                    Updated {new Date(backup.updated_at).toLocaleString()}
+                  </Text>
+                </View>
+              </Pressable>
+            ))
+          )}
+          {adminSelectedUserId ? (
+            <View style={styles.menuSection}>
+              <Text style={styles.menuLabel}>Selected Backup</Text>
+              <Text style={styles.subtle}>{adminSelectedUserId}</Text>
+              <Pressable
+                style={styles.button}
+                onPress={handlePreviewBackup}
+                disabled={adminLoading}
+              >
+                <Text style={styles.buttonText}>Preview summary</Text>
+              </Pressable>
+              <Pressable
+                style={styles.buttonGhost}
+                onPress={handleExportBackup}
+                disabled={adminLoading}
+              >
+                <Text style={styles.buttonGhostText}>Export JSON</Text>
+              </Pressable>
+              <Pressable
+                style={styles.buttonGhost}
+                onPress={handleLoadBackupForUser}
+                disabled={adminLoading}
+              >
+                <Text style={styles.buttonGhostText}>Load to this device</Text>
+              </Pressable>
+            </View>
+          ) : null}
+          {adminSummary ? (
+            <View style={styles.panelQuiet}>
+              <Text style={styles.panelTitle}>Summary</Text>
+              <View style={styles.statRow}>
+                <Text style={styles.statLabel}>Identity Level</Text>
+                <Text style={styles.statValue}>{adminSummary.identityLevel}</Text>
+              </View>
+              <View style={styles.statRow}>
+                <Text style={styles.statLabel}>Total Effort</Text>
+                <Text style={styles.statValue}>{adminSummary.totalEffort}</Text>
+              </View>
+              <View style={styles.statRow}>
+                <Text style={styles.statLabel}>Habits</Text>
+                <Text style={styles.statValue}>{adminSummary.habits}</Text>
+              </View>
+              <View style={styles.statRow}>
+                <Text style={styles.statLabel}>Efforts</Text>
+                <Text style={styles.statValue}>{adminSummary.efforts}</Text>
+              </View>
+              <View style={styles.statRow}>
+                <Text style={styles.statLabel}>Chests</Text>
+                <Text style={styles.statValue}>{adminSummary.chests}</Text>
+              </View>
+              <View style={styles.statRow}>
+                <Text style={styles.statLabel}>Items</Text>
+                <Text style={styles.statValue}>{adminSummary.items}</Text>
+              </View>
+              <View style={styles.statRow}>
+                <Text style={styles.statLabel}>Payload (bytes)</Text>
+                <Text style={styles.statValue}>{adminSummary.payloadBytes}</Text>
+              </View>
+              <Text style={styles.subtle}>
+                Updated {new Date(adminSummary.updatedAt).toLocaleString()}
+              </Text>
+            </View>
+          ) : null}
+          <Pressable
+            style={styles.buttonGhost}
+            onPress={handleSaveBackup}
+            disabled={adminBusy}
+          >
+            <Text style={styles.buttonGhostText}>Save current device backup</Text>
+          </Pressable>
+          <Pressable
+            style={styles.buttonGhost}
+            onPress={handleLoadBackup}
+            disabled={adminBusy}
+          >
+            <Text style={styles.buttonGhostText}>Load my backup to this device</Text>
+          </Pressable>
+          {adminLog.length > 0 ? (
+            <View style={styles.menuSection}>
+              <Text style={styles.menuLabel}>Recent Actions</Text>
+              {adminLog.map((entry, index) => (
+                <Text key={`${entry.at}-${index}`} style={styles.subtle}>
+                  {new Date(entry.at).toLocaleString()} — {entry.label}
+                </Text>
+              ))}
+            </View>
+          ) : null}
+          {adminMessage ? <Text style={styles.subtle}>{adminMessage}</Text> : null}
         </View>
       ) : null}
 
@@ -528,9 +984,6 @@ export default function StatusScreen() {
             </Pressable>
           </View>
         </View>
-      ) : null}
-
-
       ) : null}
 
       {showInventory ? (
@@ -667,7 +1120,7 @@ export default function StatusScreen() {
           <Text style={styles.brandIcon}>LM</Text>
         </Pressable>
         <View style={styles.navRow}>
-          {NAV_TABS.map((tab) => (
+          {navTabs.map((tab) => (
             <Pressable
               key={tab}
               onPress={() => setActiveTab(tab)}
@@ -1244,6 +1697,10 @@ const styles = StyleSheet.create({
     minHeight: 44,
     backgroundColor: '#0a152c',
   },
+  loginPanel: {
+    marginTop: 12,
+    gap: 10,
+  },
   effortRow: {
     flexDirection: 'row',
     marginBottom: 12,
@@ -1362,5 +1819,22 @@ const styles = StyleSheet.create({
     color: '#c7e2ff',
     fontSize: 12,
     marginBottom: 6,
+  },
+  adminRow: {
+    marginTop: 10,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    borderRadius: 12,
+    padding: 12,
+    backgroundColor: '#0a152c',
+  },
+  adminRowSelected: {
+    borderColor: '#6fb0ff',
+    backgroundColor: '#102244',
+  },
+  adminRowTitle: {
+    color: '#eaf4ff',
+    fontSize: 12,
+    fontWeight: '700',
   },
 });

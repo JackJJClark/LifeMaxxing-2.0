@@ -555,6 +555,15 @@ function rarityFromConsistency(count) {
   return 'common';
 }
 
+async function fetchAllRows(sql, params = []) {
+  const result = await execSql(sql, params);
+  const rows = [];
+  for (let i = 0; i < result.rows.length; i += 1) {
+    rows.push(result.rows.item(i));
+  }
+  return rows;
+}
+
 async function updateIdentityTotals(effortValue) {
   if (isWeb) {
     if (!webStore.identity) return;
@@ -945,4 +954,169 @@ export async function getStatusSnapshot() {
       chests: chestCount.rows.item(0).count || 0,
     },
   };
+}
+
+export async function exportAllData() {
+  if (isWeb) {
+    return {
+      identity: webStore.identity,
+      habits: [...webStore.habits],
+      effortLogs: [...webStore.effortLogs],
+      chests: [...webStore.chests],
+      items: [...webStore.items],
+      chestRewards: [...webStore.chestRewards],
+      combatEncounters: [...webStore.combatEncounters],
+      mercyEvents: [...webStore.mercyEvents],
+      habitEffortCache: Object.values(webStore.habitEffortCache),
+    };
+  }
+
+  const identityRows = await fetchAllRows('SELECT * FROM identity');
+  const habits = await fetchAllRows('SELECT * FROM habits');
+  const effortLogs = await fetchAllRows('SELECT * FROM effort_logs');
+  const chests = await fetchAllRows('SELECT * FROM chests');
+  const items = await fetchAllRows('SELECT * FROM items');
+  const chestRewards = await fetchAllRows('SELECT * FROM chest_rewards');
+  const combatEncounters = await fetchAllRows('SELECT * FROM combat_encounters');
+  const mercyEvents = await fetchAllRows('SELECT * FROM mercy_events');
+  const habitEffortCache = await fetchAllRows('SELECT * FROM habit_effort_cache');
+
+  return {
+    identity: identityRows.length ? identityRows[0] : null,
+    habits,
+    effortLogs,
+    chests,
+    items,
+    chestRewards,
+    combatEncounters,
+    mercyEvents,
+    habitEffortCache,
+  };
+}
+
+export async function clearAllData() {
+  if (isWeb) {
+    webStore.identity = null;
+    webStore.habits = [];
+    webStore.effortLogs = [];
+    webStore.chests = [];
+    webStore.items = [];
+    webStore.chestRewards = [];
+    webStore.combatEncounters = [];
+    webStore.mercyEvents = [];
+    webStore.habitEffortCache = {};
+    return;
+  }
+  await execSql('DELETE FROM chest_rewards');
+  await execSql('DELETE FROM combat_encounters');
+  await execSql('DELETE FROM effort_logs');
+  await execSql('DELETE FROM items');
+  await execSql('DELETE FROM chests');
+  await execSql('DELETE FROM habits');
+  await execSql('DELETE FROM mercy_events');
+  await execSql('DELETE FROM habit_effort_cache');
+  await execSql('DELETE FROM identity');
+}
+
+export async function importAllData(payload) {
+  if (!payload) return;
+  if (isWeb) {
+    webStore.identity = payload.identity || null;
+    webStore.habits = payload.habits ? [...payload.habits] : [];
+    webStore.effortLogs = payload.effortLogs ? [...payload.effortLogs] : [];
+    webStore.chests = payload.chests ? [...payload.chests] : [];
+    webStore.items = payload.items ? [...payload.items] : [];
+    webStore.chestRewards = payload.chestRewards ? [...payload.chestRewards] : [];
+    webStore.combatEncounters = payload.combatEncounters
+      ? [...payload.combatEncounters]
+      : [];
+    webStore.mercyEvents = payload.mercyEvents ? [...payload.mercyEvents] : [];
+    const cache = payload.habitEffortCache ? [...payload.habitEffortCache] : [];
+    webStore.habitEffortCache = Object.fromEntries(
+      cache.map((record) => [record.habitKey, record])
+    );
+    return;
+  }
+
+  if (payload.identity) {
+    await execSql(
+      'INSERT INTO identity (id, level, totalEffortUnits, createdAt, lastActiveAt) VALUES (?, ?, ?, ?, ?)',
+      [
+        payload.identity.id,
+        payload.identity.level,
+        payload.identity.totalEffortUnits,
+        payload.identity.createdAt,
+        payload.identity.lastActiveAt,
+      ]
+    );
+  }
+
+  for (const habit of payload.habits || []) {
+    await execSql(
+      'INSERT INTO habits (id, name, isActive, createdAt) VALUES (?, ?, ?, ?)',
+      [habit.id, habit.name, habit.isActive ? 1 : 0, habit.createdAt]
+    );
+  }
+
+  for (const log of payload.effortLogs || []) {
+    await execSql(
+      'INSERT INTO effort_logs (id, habitId, effortValue, note, timestamp, createdAt) VALUES (?, ?, ?, ?, ?, ?)',
+      [log.id, log.habitId, log.effortValue, log.note || null, log.timestamp, log.createdAt]
+    );
+  }
+
+  for (const chest of payload.chests || []) {
+    await execSql(
+      'INSERT INTO chests (id, rarity, earnedAt, unlockedRewardCount) VALUES (?, ?, ?, ?)',
+      [chest.id, chest.rarity, chest.earnedAt, chest.unlockedRewardCount || 0]
+    );
+  }
+
+  for (const item of payload.items || []) {
+    await execSql(
+      'INSERT INTO items (id, type, modifiersJson, createdAt) VALUES (?, ?, ?, ?)',
+      [item.id, item.type, item.modifiersJson, item.createdAt]
+    );
+  }
+
+  for (const reward of payload.chestRewards || []) {
+    await execSql(
+      'INSERT INTO chest_rewards (id, chestId, itemId, locked) VALUES (?, ?, ?, ?)',
+      [reward.id, reward.chestId, reward.itemId, reward.locked ? 1 : 0]
+    );
+  }
+
+  for (const encounter of payload.combatEncounters || []) {
+    await execSql(
+      'INSERT INTO combat_encounters (id, chestId, difficultyTier, completed, createdAt) VALUES (?, ?, ?, ?, ?)',
+      [
+        encounter.id,
+        encounter.chestId,
+        encounter.difficultyTier,
+        encounter.completed ? 1 : 0,
+        encounter.createdAt,
+      ]
+    );
+  }
+
+  for (const event of payload.mercyEvents || []) {
+    await execSql('INSERT INTO mercy_events (id, reason, createdAt) VALUES (?, ?, ?)', [
+      event.id,
+      event.reason,
+      event.createdAt,
+    ]);
+  }
+
+  for (const record of payload.habitEffortCache || []) {
+    await execSql(
+      'INSERT INTO habit_effort_cache (habitKey, effort, prevalence, source, updatedAt) VALUES (?, ?, ?, ?, ?)',
+      [
+        record.habitKey,
+        record.effort,
+        record.prevalence || null,
+        record.source || null,
+        record.updatedAt,
+      ]
+    );
+  }
 }
