@@ -4,6 +4,7 @@ import * as SQLite from 'expo-sqlite';
 const DB_NAME = 'lifemaxing.db';
 const isWeb = Platform.OS === 'web';
 const db = isWeb ? null : SQLite.openDatabase(DB_NAME);
+const WEB_STORE_KEY = 'lifemaxing.webstore.v1';
 
 const webStore = {
   identity: null,
@@ -16,6 +17,56 @@ const webStore = {
   mercyEvents: [],
   habitEffortCache: {},
 };
+
+function canUseWebStorage() {
+  return typeof window !== 'undefined' && window.localStorage;
+}
+
+function loadWebStore() {
+  if (!isWeb || !canUseWebStorage()) return;
+  try {
+    const raw = window.localStorage.getItem(WEB_STORE_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return;
+    webStore.identity = data.identity || null;
+    webStore.habits = Array.isArray(data.habits) ? data.habits : [];
+    webStore.effortLogs = Array.isArray(data.effortLogs) ? data.effortLogs : [];
+    webStore.chests = Array.isArray(data.chests) ? data.chests : [];
+    webStore.items = Array.isArray(data.items) ? data.items : [];
+    webStore.chestRewards = Array.isArray(data.chestRewards) ? data.chestRewards : [];
+    webStore.combatEncounters = Array.isArray(data.combatEncounters)
+      ? data.combatEncounters
+      : [];
+    webStore.mercyEvents = Array.isArray(data.mercyEvents) ? data.mercyEvents : [];
+    webStore.habitEffortCache =
+      data.habitEffortCache && typeof data.habitEffortCache === 'object'
+        ? data.habitEffortCache
+        : {};
+  } catch (error) {
+    // Ignore storage errors.
+  }
+}
+
+function saveWebStore() {
+  if (!isWeb || !canUseWebStorage()) return;
+  try {
+    const payload = {
+      identity: webStore.identity,
+      habits: webStore.habits,
+      effortLogs: webStore.effortLogs,
+      chests: webStore.chests,
+      items: webStore.items,
+      chestRewards: webStore.chestRewards,
+      combatEncounters: webStore.combatEncounters,
+      mercyEvents: webStore.mercyEvents,
+      habitEffortCache: webStore.habitEffortCache,
+    };
+    window.localStorage.setItem(WEB_STORE_KEY, JSON.stringify(payload));
+  } catch (error) {
+    // Ignore storage errors.
+  }
+}
 
 const EFFORT_UNITS_PER_LEVEL = 10;
 const CONSISTENCY_WINDOW_DAYS = 7;
@@ -213,7 +264,10 @@ function matchPrevalence(habitName) {
 }
 
 export async function initDb() {
-  if (isWeb) return;
+  if (isWeb) {
+    loadWebStore();
+    return;
+  }
   await execSql('PRAGMA foreign_keys = ON');
 
   await execSql(
@@ -360,6 +414,7 @@ export async function getOrCreateIdentity() {
       createdAt,
       lastActiveAt: createdAt,
     };
+    saveWebStore();
     return webStore.identity;
   }
   const result = await execSql('SELECT * FROM identity LIMIT 1');
@@ -384,6 +439,7 @@ export async function touchLastActive() {
     if (webStore.identity) {
       webStore.identity.lastActiveAt = timestamp;
     }
+    saveWebStore();
     return;
   }
   await execSql('UPDATE identity SET lastActiveAt = ? WHERE id IN (SELECT id FROM identity LIMIT 1)', [timestamp]);
@@ -391,15 +447,27 @@ export async function touchLastActive() {
 
 export async function getInactivityDays() {
   if (isWeb) {
-    if (!webStore.identity) return 0;
-    const lastActiveAt = new Date(webStore.identity.lastActiveAt);
-    const diffMs = Date.now() - lastActiveAt.getTime();
+    const lastEffortAt = webStore.effortLogs.length
+      ? webStore.effortLogs[webStore.effortLogs.length - 1].timestamp
+      : null;
+    const reference = lastEffortAt || webStore.identity?.createdAt || null;
+    if (!reference) return 0;
+    const diffMs = Date.now() - new Date(reference).getTime();
     return Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
   }
-  const result = await execSql('SELECT lastActiveAt FROM identity LIMIT 1');
-  if (result.rows.length === 0) return 0;
-  const lastActiveAt = new Date(result.rows.item(0).lastActiveAt);
-  const diffMs = Date.now() - lastActiveAt.getTime();
+  const lastEffortResult = await execSql(
+    'SELECT timestamp FROM effort_logs ORDER BY timestamp DESC LIMIT 1'
+  );
+  const lastEffortAt = lastEffortResult.rows.length
+    ? lastEffortResult.rows.item(0).timestamp
+    : null;
+  let reference = lastEffortAt;
+  if (!reference) {
+    const identityResult = await execSql('SELECT createdAt FROM identity LIMIT 1');
+    reference = identityResult.rows.length ? identityResult.rows.item(0).createdAt : null;
+  }
+  if (!reference) return 0;
+  const diffMs = Date.now() - new Date(reference).getTime();
   return Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
 }
 
@@ -415,6 +483,7 @@ export async function getOrCreateDefaultHabit() {
     const createdAt = nowIso();
     const habit = { id, name: 'General', isActive: true, createdAt };
     webStore.habits.push(habit);
+    saveWebStore();
     return habit;
   }
   const result = await execSql('SELECT * FROM habits WHERE name = ? LIMIT 1', ['General']);
@@ -449,6 +518,7 @@ export async function createHabit(name) {
     const createdAt = nowIso();
     const habit = { id, name, isActive: true, createdAt };
     webStore.habits.push(habit);
+    saveWebStore();
     return habit;
   }
   const id = makeId('habit');
@@ -465,6 +535,7 @@ export async function setHabitActive(habitId, isActive) {
   if (isWeb) {
     const habit = webStore.habits.find((item) => item.id === habitId);
     if (habit) habit.isActive = !!isActive;
+    saveWebStore();
     return;
   }
   await execSql('UPDATE habits SET isActive = ? WHERE id = ?', [isActive ? 1 : 0, habitId]);
@@ -474,6 +545,7 @@ export async function deleteHabit(habitId) {
   if (isWeb) {
     webStore.effortLogs = webStore.effortLogs.filter((log) => log.habitId !== habitId);
     webStore.habits = webStore.habits.filter((habit) => habit.id !== habitId);
+    saveWebStore();
     return;
   }
   await execSql('DELETE FROM effort_logs WHERE habitId = ?', [habitId]);
@@ -534,15 +606,18 @@ async function createChestRewards(chestId, rarity) {
 }
 
 async function getConsistencyScore() {
-  if (isWeb) {
-    const since = new Date();
-    since.setDate(since.getDate() - CONSISTENCY_WINDOW_DAYS);
-    return webStore.effortLogs.filter((log) => new Date(log.timestamp) >= since).length;
-  }
   const since = new Date();
   since.setDate(since.getDate() - CONSISTENCY_WINDOW_DAYS);
+  if (isWeb) {
+    const activeDays = new Set(
+      webStore.effortLogs
+        .filter((log) => new Date(log.timestamp) >= since)
+        .map((log) => log.timestamp.slice(0, 10))
+    );
+    return activeDays.size;
+  }
   const result = await execSql(
-    'SELECT COUNT(*) as count FROM effort_logs WHERE timestamp >= ?',
+    'SELECT COUNT(DISTINCT DATE(timestamp)) as count FROM effort_logs WHERE timestamp >= ?',
     [since.toISOString()]
   );
   return result.rows.item(0).count || 0;
@@ -656,6 +731,7 @@ export async function logEffort({ habitId, effortValue, note }) {
     }
   }
 
+  if (isWeb) saveWebStore();
   return { effortId: id, chestId, rarity, mercyUsed: mercy.mercyUsed, mercyBypass: mercy.bypassUnlock };
 }
 
@@ -924,6 +1000,7 @@ export async function resolveCombatEncounter({ encounterId, chestId, outcome }) 
       [selected.length, chestId]
     );
   }
+  if (isWeb) saveWebStore();
   const remaining = lockedIds.length - selected.length;
   return { unlocked: selected.length, remaining };
 }
@@ -1005,6 +1082,7 @@ export async function clearAllData() {
     webStore.combatEncounters = [];
     webStore.mercyEvents = [];
     webStore.habitEffortCache = {};
+    saveWebStore();
     return;
   }
   await execSql('DELETE FROM chest_rewards');
@@ -1035,6 +1113,7 @@ export async function importAllData(payload) {
     webStore.habitEffortCache = Object.fromEntries(
       cache.map((record) => [record.habitKey, record])
     );
+    saveWebStore();
     return;
   }
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { StyleSheet, Text, View, Pressable, TextInput, ScrollView, Platform } from 'react-native';
+import { StyleSheet, Text, View, Pressable, TextInput, ScrollView, Platform, Image } from 'react-native';
 import { ADMIN_EMAILS, isAdminEmail } from '../config';
 import { supabase } from '../services/supabase';
 import {
@@ -28,7 +28,6 @@ import {
   logEffort,
   resolveCombatEncounter,
   setHabitActive,
-  touchLastActive,
   getHabitEffortForName,
   deleteHabit,
 } from '../db/db';
@@ -154,7 +153,6 @@ export default function StatusScreen() {
     async function bootstrap() {
       await initDb();
       await getOrCreateIdentity();
-      await touchLastActive();
       if (!alive) return;
       await refresh();
       await refreshAuthStatus();
@@ -1150,7 +1148,11 @@ export default function StatusScreen() {
           style={styles.brandBox}
           onPress={() => setActiveTab('Tasks')}
         >
-          <Text style={styles.brandIcon}>LM</Text>
+          <Image
+            source={require('../../assets/lifemaxxing-logo.png')}
+            style={styles.brandLogo}
+            accessibilityLabel="Lifemaxxing logo"
+          />
         </Pressable>
         <View style={styles.navRow}>
           {navTabs.map((tab) => (
@@ -1236,7 +1238,7 @@ const styles = StyleSheet.create({
     opacity: 0.5,
   },
   topBar: {
-    height: 56,
+    height: 80,
     backgroundColor: '#0a1222',
     borderBottomWidth: 1,
     borderBottomColor: '#21406d',
@@ -1245,8 +1247,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
   },
   brandBox: {
-    width: 38,
-    height: 38,
+    width: 56,
+    height: 56,
     borderRadius: 7,
     backgroundColor: '#0a152c',
     borderWidth: 1,
@@ -1260,6 +1262,11 @@ const styles = StyleSheet.create({
     fontSize: 12,
     letterSpacing: 1.6,
     fontWeight: '700',
+  },
+  brandLogo: {
+    width: 44,
+    height: 44,
+    resizeMode: 'contain',
   },
   navRow: {
     flexDirection: 'row',
@@ -1280,7 +1287,7 @@ const styles = StyleSheet.create({
   },
   navText: {
     color: '#c7e2ff',
-    fontSize: 11,
+    fontSize: 12,
     letterSpacing: 0.8,
     textTransform: 'uppercase',
   },
