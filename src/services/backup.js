@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { isAdminEmail } from '../config';
 import { exportAllData, importAllData, clearAllData, touchLastActive } from '../db/db';
 
 const BACKUP_TABLE = 'lifemaxing_backups';
@@ -19,6 +20,10 @@ async function requireSession() {
 
 async function requireAdminSession() {
   const session = await requireSession();
+  const email = session.user?.email || '';
+  if (!isAdminEmail(email)) {
+    throw new Error('Admin access only.');
+  }
   return session;
 }
 
