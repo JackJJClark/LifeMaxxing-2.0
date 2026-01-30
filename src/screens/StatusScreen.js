@@ -4,6 +4,7 @@ import { ADMIN_EMAILS, isAdminEmail } from '../config';
 import { supabase } from '../services/supabase';
 import {
   signInWithPassword,
+  signUpWithPassword,
   signOut,
   saveBackup,
   loadBackup,
@@ -14,6 +15,7 @@ import {
 import {
   createHabit,
   createCombatEncounter,
+  clearAllData,
   getInactivityDays,
   getMercyStatus,
   getLatestLockedChest,
@@ -25,6 +27,8 @@ import {
   listItems,
   getEvidenceSummary,
   listRecentEfforts,
+  exportAllData,
+  importAllData,
   logEffort,
   resolveCombatEncounter,
   setHabitActive,
@@ -32,8 +36,26 @@ import {
   deleteHabit,
 } from '../db/db';
 
+const TOP_BAR_HEIGHT = Platform.OS === 'web' ? 80 : 88;
+const BRAND_BOX_SIZE = Platform.OS === 'web' ? 56 : 64;
+const BRAND_LOGO_SIZE = Platform.OS === 'web' ? 44 : 52;
+const EMAIL_AUTH_ENABLED = false;
+const FONT = {
+  xs: 11,
+  sm: 12,
+  md: 14,
+  lg: 16,
+  xl: 20,
+  hero: 36,
+};
+const ACCENT_GOLD = '#f6c46a';
+const ACCENT_GOLD = '#f6c46a';
+
 export default function StatusScreen() {
   const SHOW_TRUST_TESTS = true;
+  const QUIET_MODE_DAYS = 2;
+  const EFFORT_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+  const EFFORT_PRESETS = [3, 5, 7, 10];
   const BASE_TABS = [
     'Tasks',
     'Inventory',
@@ -54,6 +76,8 @@ export default function StatusScreen() {
   const [efforts, setEfforts] = useState([]);
   const [effortFilter, setEffortFilter] = useState('all');
   const [effortInfo, setEffortInfo] = useState(null);
+  const [effortNote, setEffortNote] = useState('');
+  const [selectedEffort, setSelectedEffort] = useState(null);
   const [habitEfforts, setHabitEfforts] = useState({});
   const [evidence, setEvidence] = useState(null);
   const [combatChest, setCombatChest] = useState(null);
@@ -67,6 +91,10 @@ export default function StatusScreen() {
   const [authEmail, setAuthEmail] = useState('');
   const [adminStatus, setAdminStatus] = useState('unknown');
   const [adminMessage, setAdminMessage] = useState('');
+  const [lastBackupAt, setLastBackupAt] = useState(null);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(false);
+  const [onboardingStep, setOnboardingStep] = useState('login');
   const [adminBusy, setAdminBusy] = useState(false);
   const [adminBackups, setAdminBackups] = useState([]);
   const [adminFilter, setAdminFilter] = useState('');
@@ -125,10 +153,17 @@ export default function StatusScreen() {
   }
 
   async function refreshAuthStatus() {
-    if (!authEnabled) {
+    if (!authEnabled || !EMAIL_AUTH_ENABLED) {
       setAuthStatus('disabled');
       setAuthEmail('');
       setAdminStatus(adminEnabled ? 'signed_out' : 'disabled');
+      setLastBackupAt(null);
+      if (Platform.OS === 'web' && !onboardingDismissed) {
+        setShowOnboarding(true);
+        setOnboardingStep('login');
+      } else {
+        setShowOnboarding(false);
+      }
       return;
     }
     const { data } = await supabase.auth.getSession();
@@ -136,6 +171,11 @@ export default function StatusScreen() {
       setAuthStatus('signed_out');
       setAuthEmail('');
       setAdminStatus(adminEnabled ? 'signed_out' : 'disabled');
+      setLastBackupAt(null);
+      if (Platform.OS === 'web' && !onboardingDismissed) {
+        setShowOnboarding(true);
+        setOnboardingStep('login');
+      }
       return;
     }
     const sessionEmail = data.session.user?.email || '';
@@ -146,6 +186,7 @@ export default function StatusScreen() {
     } else {
       setAdminStatus(adminEnabled ? 'signed_out' : 'disabled');
     }
+    setShowOnboarding(false);
   }
 
   useEffect(() => {
@@ -180,6 +221,18 @@ export default function StatusScreen() {
   useEffect(() => {
     if (Platform.OS !== 'web') return;
     try {
+      const stored = window.localStorage.getItem('lifemaxing.onboarding.dismissed');
+      if (stored === 'true') {
+        setOnboardingDismissed(true);
+      }
+    } catch (error) {
+      // Ignore storage errors.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web') return;
+    try {
       window.localStorage.setItem('lifemaxing.activeTab', activeTab);
     } catch (error) {
       // Ignore storage errors.
@@ -201,10 +254,14 @@ export default function StatusScreen() {
     async function loadEffortInfo() {
       if (!selectedHabit) {
         setEffortInfo(null);
+        setSelectedEffort(null);
         return;
       }
       const info = await getHabitEffortForName(selectedHabit.name);
-      if (alive) setEffortInfo(info);
+      if (alive) {
+        setEffortInfo(info);
+        setSelectedEffort(info.effort);
+      }
     }
     loadEffortInfo();
     return () => {
@@ -218,9 +275,9 @@ export default function StatusScreen() {
     }
   }, [showAdminTab, activeTab]);
 
-  const isQuietMode = inactivityDays >= 3;
+  const isQuietMode = inactivityDays >= QUIET_MODE_DAYS;
 
-  async function handleLogEffort(customHabitId, customHabitName) {
+  async function handleLogEffort(customHabitId, customHabitName, customEffortValue) {
     const targetHabitId = customHabitId || habitId;
     if (!targetHabitId) return;
     const targetHabit = customHabitName
@@ -230,12 +287,28 @@ export default function StatusScreen() {
       return;
     }
     const effortInfo = await getHabitEffortForName(targetHabit.name);
+    const resolvedEffort =
+      typeof customEffortValue === 'number'
+        ? customEffortValue
+        : typeof selectedEffort === 'number'
+        ? selectedEffort
+        : effortInfo?.effort || 5;
+    const cleanedNote = effortNote.trim();
     const result = await logEffort({
       habitId: targetHabitId,
-      effortValue: effortInfo.effort,
-      note: null,
+      effortValue: resolvedEffort,
+      note: cleanedNote.length ? cleanedNote : null,
     });
     await refresh();
+    setEffortNote('');
+    if (authStatus === 'signed_in') {
+      try {
+        const record = await saveBackup();
+        setLastBackupAt(record.updated_at);
+      } catch (error) {
+        setAccountMessage(error?.message || 'Auto-backup failed.');
+      }
+    }
   }
 
   async function handleCombat(outcome) {
@@ -256,7 +329,7 @@ export default function StatusScreen() {
   }
 
   async function handleAccountSignIn() {
-    if (!authEnabled) {
+    if (!authEnabled || !EMAIL_AUTH_ENABLED) {
       setAccountMessage('Account linking is not enabled.');
       return;
     }
@@ -266,7 +339,14 @@ export default function StatusScreen() {
     try {
       await signInWithPassword(loginEmail.trim(), loginPassword);
       await refreshAuthStatus();
-      setAccountMessage('Signed in.');
+      try {
+        const record = await loadBackup();
+        setLastBackupAt(record.updated_at);
+        await refresh();
+        setAccountMessage('Signed in. Latest backup loaded.');
+      } catch (error) {
+        setAccountMessage(error?.message || 'Signed in. No backup found.');
+      }
       setAdminLog((prev) => [
         { label: 'Signed in', at: new Date().toISOString() },
         ...prev,
@@ -294,6 +374,7 @@ export default function StatusScreen() {
     try {
       await signOut();
       await refreshAuthStatus();
+      setLastBackupAt(null);
       setAccountMessage('Signed out.');
       setAdminLog((prev) => [
         { label: 'Signed out', at: new Date().toISOString() },
@@ -320,6 +401,7 @@ export default function StatusScreen() {
     setAdminMessage('');
     try {
       const record = await saveBackup();
+      setLastBackupAt(record.updated_at);
       const message = `Backup saved (${new Date(record.updated_at).toLocaleString()}).`;
       setAccountMessage(message);
       setAdminMessage(message);
@@ -347,6 +429,7 @@ export default function StatusScreen() {
     setAdminMessage('');
     try {
       const record = await loadBackup();
+      setLastBackupAt(record.updated_at);
       await refresh();
       const message = `Backup loaded (${new Date(record.updated_at).toLocaleString()}).`;
       setAccountMessage(message);
@@ -532,11 +615,132 @@ export default function StatusScreen() {
     await refresh();
   }
 
+  async function handleAccountSignUp() {
+    if (!authEnabled || !EMAIL_AUTH_ENABLED) {
+      setAccountMessage('Account linking is not enabled.');
+      return;
+    }
+    setAdminBusy(true);
+    setAccountMessage('');
+    setAdminMessage('');
+    try {
+      await signUpWithPassword(loginEmail.trim(), loginPassword);
+      await refreshAuthStatus();
+      setAccountMessage('Sign up complete. Check your email to confirm, then sign in.');
+      setAdminLog((prev) => [
+        { label: 'Signed up', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+      setShowLoginForm(false);
+      setLoginPassword('');
+      setOnboardingStep('login');
+    } catch (error) {
+      setAccountMessage(error?.message || 'Sign up failed.');
+    } finally {
+      setAdminBusy(false);
+    }
+  }
+
+  function handleContinueGuest() {
+    setShowOnboarding(false);
+    setOnboardingDismissed(true);
+    setOnboardingStep('login');
+    if (Platform.OS === 'web') {
+      try {
+        window.localStorage.setItem('lifemaxing.onboarding.dismissed', 'true');
+      } catch (error) {
+        // Ignore storage errors.
+      }
+    }
+  }
+
+  async function handleResetLocalData() {
+    const confirmReset =
+      Platform.OS !== 'web' ||
+      (typeof window !== 'undefined' &&
+        window.confirm('Clear all local data on this device? This cannot be undone.'));
+    if (!confirmReset) return;
+    await clearAllData();
+    await getOrCreateIdentity();
+    setHabitId(null);
+    await refresh();
+    setAccountMessage('Local data cleared on this device.');
+  }
+
+  function handleShowOnboarding() {
+    setShowOnboarding(true);
+    setOnboardingStep('login');
+    setOnboardingDismissed(false);
+    if (Platform.OS === 'web') {
+      try {
+        window.localStorage.setItem('lifemaxing.onboarding.dismissed', 'false');
+      } catch (error) {
+        // Ignore storage errors.
+      }
+    }
+  }
+
+  async function handleExportLocalData() {
+    if (Platform.OS !== 'web') {
+      setAccountMessage('Export is available on web only.');
+      return;
+    }
+    try {
+      const payload = await exportAllData();
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+      link.href = url;
+      link.download = `lifemaxing_export_${stamp}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setAccountMessage('Local data exported.');
+    } catch (error) {
+      setAccountMessage(error?.message || 'Export failed.');
+    }
+  }
+
+  async function handleImportLocalData() {
+    if (Platform.OS !== 'web') {
+      setAccountMessage('Import is available on web only.');
+      return;
+    }
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'application/json';
+    input.onchange = async (event) => {
+      const file = event.target?.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          const payload = JSON.parse(reader.result);
+          await clearAllData();
+          await importAllData(payload);
+          await refresh();
+          setAccountMessage('Local data imported.');
+        } catch (error) {
+          setAccountMessage(error?.message || 'Import failed.');
+        }
+      };
+      reader.readAsText(file);
+    };
+    input.click();
+  }
+
   if (loading || !snapshot) {
     return (
-      <View style={styles.container}>
-        <Text style={styles.title}>Lifemaxxing</Text>
-        <Text style={styles.muted}>Preparing identity...</Text>
+      <View style={styles.loadingContainer}>
+        <View style={styles.loadingPanel}>
+          <Image
+            source={require('../../assets/lifemaxxing-logo.png')}
+            style={styles.loadingLogo}
+            accessibilityLabel="Lifemaxxing logo"
+          />
+          <Text style={styles.loadingTitle}>Lifemaxxing</Text>
+          <Text style={styles.loadingSubtle}>Stabilizing identity...</Text>
+        </View>
       </View>
     );
   }
@@ -677,11 +881,19 @@ export default function StatusScreen() {
             <Text style={styles.statValue}>{counts.chests}</Text>
           </View>
           <Text style={styles.subtle}>
-            Re-entry mode: {isQuietMode ? 'quiet' : 'standard'} ({inactivityDays} days)
+            Days since last effort: {inactivityDays}
+          </Text>
+          <Text style={styles.subtle}>
+            Re-entry mode: {isQuietMode ? 'quiet' : 'standard'} (quiet after {QUIET_MODE_DAYS}+ days)
           </Text>
           <Text style={styles.subtle}>
             Active habits: {activeHabits} - Paused: {pausedHabits}
           </Text>
+          {!EMAIL_AUTH_ENABLED ? (
+            <Text style={styles.subtle}>
+              Email sign-in disabled until a domain is configured.
+            </Text>
+          ) : null}
           {mercyStatus?.eligible ? (
             <Text style={styles.subtle}>Mercy active: slight chest boost on next effort.</Text>
           ) : null}
@@ -798,6 +1010,9 @@ export default function StatusScreen() {
           {authStatus === 'signed_in' ? (
             <View style={styles.menuSection}>
               <Text style={styles.menuLabel}>Backup</Text>
+              <Text style={styles.subtle}>
+                Last backup: {lastBackupAt ? new Date(lastBackupAt).toLocaleString() : 'None'}
+              </Text>
               <Pressable
                 style={styles.buttonGhost}
                 onPress={handleSaveBackup}
@@ -814,6 +1029,24 @@ export default function StatusScreen() {
               </Pressable>
             </View>
           ) : null}
+          <View style={styles.menuSection}>
+            <Text style={styles.menuLabel}>Local Data</Text>
+            <Pressable style={styles.buttonGhost} onPress={handleExportLocalData}>
+              <Text style={styles.buttonGhostText}>Export local data</Text>
+            </Pressable>
+            <Pressable style={styles.buttonGhost} onPress={handleImportLocalData}>
+              <Text style={styles.buttonGhostText}>Import local data</Text>
+            </Pressable>
+            <Pressable style={styles.buttonGhost} onPress={handleResetLocalData}>
+              <Text style={styles.buttonGhostText}>Reset local data</Text>
+            </Pressable>
+          </View>
+          <View style={styles.menuSection}>
+            <Text style={styles.menuLabel}>Account & Onboarding</Text>
+            <Pressable style={styles.buttonGhost} onPress={handleShowOnboarding}>
+              <Text style={styles.buttonGhostText}>Show onboarding</Text>
+            </Pressable>
+          </View>
           {accountMessage ? <Text style={styles.subtle}>{accountMessage}</Text> : null}
         </View>
       ) : null}
@@ -821,6 +1054,9 @@ export default function StatusScreen() {
       {showAdmin ? (
         <View style={styles.panel}>
           <Text style={styles.panelTitle}>Admin Dashboard</Text>
+          <Text style={styles.subtle}>
+            Server must enforce RLS. Client checks alone are not sufficient.
+          </Text>
           {adminStatus === 'disabled' ? (
             <Text style={styles.subtle}>Admin tools are disabled.</Text>
           ) : null}
@@ -1002,6 +1238,62 @@ export default function StatusScreen() {
               </View>
             ))
           )}
+          <View style={styles.menuDivider} />
+          <Text style={styles.panelTitle}>Log Effort</Text>
+          <View style={styles.effortPresetRow}>
+            {EFFORT_PRESETS.map((value) => (
+              <Pressable
+                key={`preset-${value}`}
+                style={[
+                  styles.effortPreset,
+                  selectedEffort === value && styles.effortPresetActive,
+                ]}
+                onPress={() => setSelectedEffort(value)}
+              >
+                <Text style={styles.filterText}>{value}</Text>
+              </Pressable>
+            ))}
+          </View>
+          {selectedHabit ? (
+            <>
+              <Text style={styles.subtle}>
+                Selected: {selectedHabit.name} {selectedHabit.isActive ? '' : '(paused)'}
+              </Text>
+              <Text style={styles.subtle}>
+                Suggested effort: {effortInfo ? `${effortInfo.effort}/10` : '...'}
+              </Text>
+              <View style={styles.effortRow}>
+                {EFFORT_OPTIONS.map((value) => (
+                  <Pressable
+                    key={`effort-${value}`}
+                    style={[
+                      styles.effortChip,
+                      selectedEffort === value && styles.effortChipSelected,
+                    ]}
+                    onPress={() => setSelectedEffort(value)}
+                  >
+                    <Text style={styles.effortText}>{value}</Text>
+                  </Pressable>
+                ))}
+              </View>
+              <TextInput
+                value={effortNote}
+                onChangeText={setEffortNote}
+                placeholder="Optional note..."
+                placeholderTextColor="#4b5563"
+                style={[styles.input, styles.noteInput]}
+              />
+              <Pressable
+                style={[styles.button, !selectedHabit.isActive && styles.buttonDisabled]}
+                onPress={() => handleLogEffort(selectedHabit.id, selectedHabit.name)}
+                disabled={!selectedHabit.isActive}
+              >
+                <Text style={styles.buttonText}>Log effort</Text>
+              </Pressable>
+            </>
+          ) : (
+            <Text style={styles.subtle}>Select a habit to log effort.</Text>
+          )}
           <View style={styles.habitInputRow}>
             <TextInput
               value={newHabitName}
@@ -1026,7 +1318,7 @@ export default function StatusScreen() {
             <View style={styles.grid}>
               {chests.map((chest) => (
                 <View key={chest.id} style={styles.gridCard}>
-                  <Text style={styles.gridTitle}>{chest.rarity.toUpperCase()}</Text>
+                  <Text style={styles.rarityTitle}>{chest.rarity.toUpperCase()}</Text>
                   <Text style={styles.gridSubtle}>{chest.rewardCount} rewards</Text>
                   <Text style={styles.gridSubtle}>{chest.lockedCount} locked</Text>
                 </View>
@@ -1142,6 +1434,136 @@ export default function StatusScreen() {
 
   return (
     <View style={styles.appFrame}>
+      <View style={styles.backgroundNebula} pointerEvents="none" />
+      <View style={styles.backgroundRing} pointerEvents="none" />
+      <Image
+        source={require('../../assets/lifemaxxing-logo.png')}
+        style={styles.backgroundLogo}
+        accessibilityIgnoresInvertColors
+      />
+      {showOnboarding ? (
+        <View style={styles.onboardingOverlay}>
+          <View
+            style={[
+              styles.onboardingCard,
+              onboardingStep === 'signup' && styles.onboardingCardSignup,
+            ]}
+          >
+            <Image
+              source={require('../../assets/lifemaxxing-logo.png')}
+              style={styles.onboardingLogo}
+              accessibilityLabel="Lifemaxxing logo"
+            />
+            {!EMAIL_AUTH_ENABLED ? (
+              <>
+                <Text style={styles.onboardingTitle}>Welcome to Lifemaxxing</Text>
+                <Text style={styles.onboardingSubtle}>
+                  Email sign-in is coming soon. Continue as guest for now.
+                </Text>
+                <View style={styles.loginPanel}>
+                  <Pressable style={styles.button} onPress={handleContinueGuest}>
+                    <Text style={styles.buttonText}>Skip for now</Text>
+                  </Pressable>
+                </View>
+              </>
+            ) : onboardingStep === 'login' ? (
+              <>
+                <Text style={styles.onboardingTitle}>Welcome to Lifemaxxing</Text>
+                <Text style={styles.onboardingSubtle}>
+                  Sign in to restore your identity or continue as guest.
+                </Text>
+                <View style={styles.loginPanel}>
+                  <TextInput
+                    value={loginEmail}
+                    onChangeText={setLoginEmail}
+                    placeholder="Email"
+                    placeholderTextColor="#4b5563"
+                    style={styles.input}
+                    autoCapitalize="none"
+                    keyboardType="email-address"
+                  />
+                  <TextInput
+                    value={loginPassword}
+                    onChangeText={setLoginPassword}
+                    placeholder="Password"
+                    placeholderTextColor="#4b5563"
+                    style={styles.input}
+                    secureTextEntry
+                  />
+                  <Pressable
+                    style={styles.button}
+                    onPress={handleAccountSignIn}
+                    disabled={adminBusy}
+                  >
+                    <Text style={styles.buttonText}>Sign in</Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.buttonGhost}
+                    onPress={() => setOnboardingStep('signup')}
+                    disabled={adminBusy}
+                  >
+                    <Text style={styles.buttonGhostText}>Create account</Text>
+                  </Pressable>
+                  <Pressable style={styles.buttonGhost} onPress={handleContinueGuest}>
+                    <Text style={styles.buttonGhostText}>Skip for now</Text>
+                  </Pressable>
+                </View>
+              </>
+            ) : (
+              <>
+                <Text style={styles.onboardingTitle}>Claim your identity</Text>
+                <Text style={styles.onboardingSubtle}>
+                  Create an account to back up your progress and return anytime.
+                </Text>
+                <View style={styles.onboardingBenefits}>
+                  <Text style={styles.onboardingBenefitItem}>
+                    - Save your identity and chests to the cloud
+                  </Text>
+                  <Text style={styles.onboardingBenefitItem}>
+                    - Restore on any device
+                  </Text>
+                  <Text style={styles.onboardingBenefitItem}>
+                    - Zero impact on effort rules
+                  </Text>
+                </View>
+                <View style={styles.loginPanel}>
+                  <TextInput
+                    value={loginEmail}
+                    onChangeText={setLoginEmail}
+                    placeholder="Email"
+                    placeholderTextColor="#4b5563"
+                    style={styles.input}
+                    autoCapitalize="none"
+                    keyboardType="email-address"
+                  />
+                  <TextInput
+                    value={loginPassword}
+                    onChangeText={setLoginPassword}
+                    placeholder="Password"
+                    placeholderTextColor="#4b5563"
+                    style={styles.input}
+                    secureTextEntry
+                  />
+                  <Pressable
+                    style={styles.button}
+                    onPress={handleAccountSignUp}
+                    disabled={adminBusy}
+                  >
+                    <Text style={styles.buttonText}>Sign up</Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.buttonGhost}
+                    onPress={() => setOnboardingStep('login')}
+                  >
+                    <Text style={styles.buttonGhostText}>Back to sign in</Text>
+                  </Pressable>
+                </View>
+              </>
+            )}
+            {accountMessage ? <Text style={styles.subtle}>{accountMessage}</Text> : null}
+          </View>
+        </View>
+      ) : null}
       <View style={styles.appFrameGlow} pointerEvents="none" />
       <View style={styles.topBar}>
         <Pressable
@@ -1195,9 +1617,10 @@ export default function StatusScreen() {
           </View>
         </View>
 
-        <View style={styles.centerPanel}>
-          <View style={styles.centerHeader}>
-            <Text style={styles.centerTitle}>{activeTab.toUpperCase()}</Text>
+      <View style={styles.centerPanel}>
+        <View style={styles.centerRuneRing} pointerEvents="none" />
+        <View style={styles.centerHeader}>
+          <Text style={styles.centerTitle}>{activeTab.toUpperCase()}</Text>
             <View style={styles.centerTabs}>
               <View style={styles.centerTabActive}>
                 <Text style={styles.centerTabText}>STATUS</Text>
@@ -1226,7 +1649,7 @@ export default function StatusScreen() {
 const styles = StyleSheet.create({
   appFrame: {
     flex: 1,
-    backgroundColor: '#05070f',
+    backgroundColor: '#070914',
   },
   appFrameGlow: {
     position: 'absolute',
@@ -1234,25 +1657,55 @@ const styles = StyleSheet.create({
     left: -60,
     right: -60,
     height: 240,
-    backgroundColor: '#0b1a36',
+    backgroundColor: '#122757',
     opacity: 0.5,
   },
+  backgroundNebula: {
+    position: 'absolute',
+    top: -140,
+    right: -120,
+    width: 320,
+    height: 320,
+    borderRadius: 200,
+    backgroundColor: '#2b1a5b',
+    opacity: 0.35,
+  },
+  backgroundRing: {
+    position: 'absolute',
+    top: 120,
+    left: -120,
+    width: 420,
+    height: 420,
+    borderRadius: 220,
+    borderWidth: 2,
+    borderColor: '#1f4e8b',
+    opacity: 0.35,
+  },
+  backgroundLogo: {
+    position: 'absolute',
+    right: -40,
+    bottom: -30,
+    width: 240,
+    height: 240,
+    opacity: 0.08,
+    resizeMode: 'contain',
+  },
   topBar: {
-    height: 80,
-    backgroundColor: '#0a1222',
+    height: TOP_BAR_HEIGHT,
+    backgroundColor: '#0c1326',
     borderBottomWidth: 1,
-    borderBottomColor: '#21406d',
+    borderBottomColor: '#2b5aa2',
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 18,
   },
   brandBox: {
-    width: 56,
-    height: 56,
+    width: BRAND_BOX_SIZE,
+    height: BRAND_BOX_SIZE,
     borderRadius: 7,
-    backgroundColor: '#0a152c',
+    backgroundColor: '#0b1733',
     borderWidth: 1,
-    borderColor: '#6fb0ff',
+    borderColor: '#6fd0ff',
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 16,
@@ -1264,8 +1717,8 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   brandLogo: {
-    width: 44,
-    height: 44,
+    width: BRAND_LOGO_SIZE,
+    height: BRAND_LOGO_SIZE,
     resizeMode: 'contain',
   },
   navRow: {
@@ -1281,13 +1734,13 @@ const styles = StyleSheet.create({
     borderColor: 'transparent',
   },
   navItemActive: {
-    backgroundColor: '#102244',
+    backgroundColor: '#12315a',
     borderWidth: 1,
-    borderColor: '#8ac2ff',
+    borderColor: '#7bc7ff',
   },
   navText: {
-    color: '#c7e2ff',
-    fontSize: 12,
+    color: '#cfeaff',
+    fontSize: FONT.sm,
     letterSpacing: 0.8,
     textTransform: 'uppercase',
   },
@@ -1303,54 +1756,65 @@ const styles = StyleSheet.create({
   },
   sidePanel: {
     width: 240,
-    backgroundColor: '#091324',
+    backgroundColor: '#0c1732',
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#1f3b66',
+    borderColor: '#24508f',
     padding: 14,
   },
   sideBlock: {
     borderWidth: 1,
-    borderColor: '#203a5f',
+    borderColor: '#2b4e82',
     borderRadius: 10,
     padding: 12,
     marginBottom: 12,
-    backgroundColor: '#0b172c',
+    backgroundColor: '#0f1d3b',
   },
   sideLabel: {
-    color: '#7fb3ff',
-    fontSize: 11,
+    color: '#8bd6ff',
+    fontSize: FONT.xs,
     letterSpacing: 1.2,
     textTransform: 'uppercase',
     marginBottom: 6,
   },
   sideValue: {
     color: '#e9f4ff',
-    fontSize: 16,
+    fontSize: FONT.lg,
     fontWeight: '700',
     marginBottom: 4,
   },
   sideMeta: {
     color: '#9bb3d6',
-    fontSize: 12,
+    fontSize: FONT.sm,
   },
   centerPanel: {
     flex: 1,
-    backgroundColor: '#0a1222',
+    backgroundColor: '#0d1832',
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#21406d',
+    borderColor: '#2c5aa0',
     overflow: 'hidden',
+  },
+  centerRuneRing: {
+    position: 'absolute',
+    top: -120,
+    right: -80,
+    width: 360,
+    height: 360,
+    borderRadius: 200,
+    borderWidth: 1,
+    borderColor: '#2a5aa6',
+    opacity: 0.22,
   },
   centerHeader: {
     padding: 14,
     borderBottomWidth: 1,
-    borderBottomColor: '#223b60',
-    backgroundColor: '#0b1931',
+    borderBottomColor: '#2a4f86',
+    backgroundColor: '#0e1f3f',
   },
   centerTitle: {
-    color: '#d2e7ff',
-    fontSize: 13,
+    color: '#e2f1ff',
+    fontSize: FONT.sm,
     letterSpacing: 4,
     fontWeight: '700',
     marginBottom: 10,
@@ -1364,20 +1828,20 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     borderRadius: 6,
     borderWidth: 1,
-    borderColor: '#2a4775',
-    backgroundColor: '#0a1426',
+    borderColor: '#2f5ca3',
+    backgroundColor: '#0c1b36',
   },
   centerTabActive: {
     paddingVertical: 6,
     paddingHorizontal: 10,
     borderRadius: 6,
     borderWidth: 1,
-    borderColor: '#8ac2ff',
-    backgroundColor: '#11264c',
+    borderColor: '#7bc7ff',
+    backgroundColor: '#143062',
   },
   centerTabText: {
     color: '#c7e2ff',
-    fontSize: 11,
+    fontSize: FONT.xs,
     letterSpacing: 1,
   },
   centerScroll: {
@@ -1435,6 +1899,107 @@ const styles = StyleSheet.create({
     paddingBottom: 0,
     backgroundColor: 'transparent',
   },
+  loadingContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#05070f',
+    padding: 24,
+  },
+  loadingPanel: {
+    alignItems: 'center',
+    padding: 24,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#1f3b66',
+    backgroundColor: '#0b162d',
+    shadowColor: '#6fb0ff',
+    shadowOpacity: 0.2,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 0 },
+  },
+  loadingLogo: {
+    width: 120,
+    height: 120,
+    resizeMode: 'contain',
+    marginBottom: 12,
+  },
+  loadingTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#c7e2ff',
+    marginBottom: 8,
+    letterSpacing: 2.2,
+    textTransform: 'uppercase',
+  },
+  loadingSubtle: {
+    color: '#9bb3d6',
+    fontSize: 13,
+  },
+  onboardingOverlay: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    backgroundColor: 'rgba(5, 7, 15, 0.86)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+    zIndex: 10,
+  },
+  onboardingCard: {
+    width: '100%',
+    maxWidth: 420,
+    borderRadius: 18,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#1f3b66',
+    backgroundColor: '#0b162d',
+    shadowColor: '#6fb0ff',
+    shadowOpacity: 0.22,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 0 },
+  },
+  onboardingCardSignup: {
+    borderColor: '#7bc7ff',
+    backgroundColor: '#0b1a33',
+  },
+  onboardingLogo: {
+    width: 96,
+    height: 96,
+    resizeMode: 'contain',
+    alignSelf: 'center',
+    marginBottom: 12,
+  },
+  onboardingTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#eaf4ff',
+    textAlign: 'center',
+    marginBottom: 6,
+    letterSpacing: 1.6,
+    textTransform: 'uppercase',
+  },
+  onboardingSubtle: {
+    color: '#9bb3d6',
+    fontSize: 12,
+    textAlign: 'center',
+    marginBottom: 12,
+  },
+  onboardingBenefits: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#1f3b66',
+    backgroundColor: '#0a152c',
+    padding: 12,
+    marginBottom: 12,
+  },
+  onboardingBenefitItem: {
+    color: '#c7e2ff',
+    fontSize: 12,
+    marginBottom: 6,
+  },
   title: {
     fontSize: 20,
     fontWeight: '700',
@@ -1444,13 +2009,13 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   panel: {
-    backgroundColor: '#0b162d',
+    backgroundColor: '#0f1c3b',
     borderRadius: 12,
     padding: 14,
     marginBottom: 14,
     borderWidth: 1,
-    borderColor: '#1f3b66',
-    shadowColor: '#6fb0ff',
+    borderColor: '#2c5aa0',
+    shadowColor: '#6fd0ff',
     shadowOpacity: 0.18,
     shadowRadius: 12,
     shadowOffset: { width: 0, height: 0 },
@@ -1459,25 +2024,25 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
   },
   panelQuiet: {
-    backgroundColor: '#0a152c',
+    backgroundColor: '#0f1a35',
     borderRadius: 12,
     padding: 14,
     marginBottom: 14,
     borderWidth: 1,
-    borderColor: '#1f3b66',
-    shadowColor: '#6fb0ff',
+    borderColor: '#2c5aa0',
+    shadowColor: '#6fd0ff',
     shadowOpacity: 0.14,
     shadowRadius: 10,
     shadowOffset: { width: 0, height: 0 },
   },
   menuStack: {
-    backgroundColor: '#0b162d',
+    backgroundColor: '#0f1c3b',
     borderRadius: 12,
     padding: 14,
     marginBottom: 14,
     borderWidth: 1,
-    borderColor: '#1f3b66',
-    shadowColor: '#6fb0ff',
+    borderColor: '#2c5aa0',
+    shadowColor: '#6fd0ff',
     shadowOpacity: 0.18,
     shadowRadius: 12,
     shadowOffset: { width: 0, height: 0 },
@@ -1487,7 +2052,7 @@ const styles = StyleSheet.create({
   },
   menuHint: {
     color: '#9bb3d6',
-    fontSize: 12,
+    fontSize: FONT.sm,
     marginTop: 4,
   },
   menuSection: {
@@ -1495,39 +2060,42 @@ const styles = StyleSheet.create({
   },
   menuDivider: {
     height: 1,
-    backgroundColor: '#1f3b66',
+    backgroundColor: '#2a4f86',
     marginVertical: 8,
   },
   menuLabel: {
-    color: '#9fd0ff',
-    fontSize: 13,
+    color: '#9fe1ff',
+    fontSize: FONT.sm,
     letterSpacing: 0.6,
     textTransform: 'uppercase',
     marginBottom: 6,
   },
   panelTitle: {
-    color: '#9fd0ff',
-    fontSize: 12,
+    color: '#9fe1ff',
+    fontSize: FONT.sm,
     letterSpacing: 1.4,
     textTransform: 'uppercase',
     marginBottom: 10,
   },
   subtle: {
     color: '#9bb3d6',
-    fontSize: 12,
+    fontSize: FONT.sm,
     marginTop: 6,
   },
   muted: {
     color: '#9bb3d6',
-    fontSize: 14,
+    fontSize: FONT.md,
   },
   button: {
-    backgroundColor: '#1b5fa7',
+    backgroundColor: '#1e63b8',
     borderRadius: 8,
     paddingVertical: 10,
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: '#6fb0ff',
+    borderColor: '#79d2ff',
+  },
+  buttonDisabled: {
+    opacity: 0.5,
   },
   buttonQuiet: {
     backgroundColor: '#1b5fa7',
@@ -1539,13 +2107,13 @@ const styles = StyleSheet.create({
     borderColor: '#6fb0ff',
   },
   buttonSmall: {
-    backgroundColor: '#1b5fa7',
+    backgroundColor: '#1e63b8',
     borderRadius: 8,
     paddingVertical: 10,
     paddingHorizontal: 12,
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: '#6fb0ff',
+    borderColor: '#79d2ff',
   },
   buttonText: {
     color: '#eaf4ff',
@@ -1567,14 +2135,14 @@ const styles = StyleSheet.create({
     height: 76,
     borderRadius: 16,
     borderWidth: 1,
-    borderColor: '#2b4a78',
+    borderColor: '#2f5ca3',
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#0a152c',
+    backgroundColor: '#0d1b36',
   },
   avatarText: {
-    color: '#90c9ff',
-    fontSize: 12,
+    color: '#8bd6ff',
+    fontSize: FONT.sm,
     letterSpacing: 1.4,
   },
   heroStats: {
@@ -1582,19 +2150,19 @@ const styles = StyleSheet.create({
   },
   heroLabel: {
     color: '#9bb3d6',
-    fontSize: 12,
+    fontSize: FONT.sm,
     letterSpacing: 1.1,
     textTransform: 'uppercase',
   },
   heroValue: {
-    color: '#eaf4ff',
-    fontSize: 36,
+    color: ACCENT_GOLD,
+    fontSize: FONT.hero,
     fontWeight: '700',
     marginTop: 4,
   },
   heroSubtle: {
     color: '#9bb3d6',
-    fontSize: 13,
+    fontSize: FONT.sm,
     marginTop: 2,
   },
   divider: {
@@ -1609,12 +2177,12 @@ const styles = StyleSheet.create({
   },
   statLabel: {
     color: '#c7e2ff',
-    fontSize: 14,
+    fontSize: FONT.md,
     letterSpacing: 0.4,
   },
   statValue: {
     color: '#eaf4ff',
-    fontSize: 14,
+    fontSize: FONT.md,
     fontWeight: '700',
   },
   habitRow: {
@@ -1706,7 +2274,27 @@ const styles = StyleSheet.create({
   },
   effortRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
     marginBottom: 12,
+  },
+  effortPresetRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 10,
+  },
+  effortPreset: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    backgroundColor: '#0a152c',
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+  },
+  effortPresetActive: {
+    borderColor: '#79d2ff',
+    backgroundColor: '#12315a',
   },
   effortChip: {
     width: 44,
@@ -1727,6 +2315,9 @@ const styles = StyleSheet.create({
     color: '#eaf4ff',
     fontSize: 16,
     fontWeight: '700',
+  },
+  noteInput: {
+    marginBottom: 8,
   },
   combatRow: {
     marginTop: 12,
@@ -1759,7 +2350,15 @@ const styles = StyleSheet.create({
   },
   gridTitle: {
     color: '#eaf4ff',
-    fontSize: 14,
+    fontSize: FONT.md,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    marginBottom: 6,
+  },
+  rarityTitle: {
+    color: ACCENT_GOLD,
+    fontSize: FONT.md,
     fontWeight: '700',
     textTransform: 'uppercase',
     letterSpacing: 0.6,

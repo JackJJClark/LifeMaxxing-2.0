@@ -8,13 +8,13 @@ const ADMIN_EMAILS_RAW = process.env.EXPO_PUBLIC_ADMIN_EMAILS || '';
 const ADMIN_EMAILS = ADMIN_EMAILS_RAW
   .split(',')
   .map((value) => value.trim().toLowerCase())
-  .filter(Boolean);
+  .filter((value) => value.includes('@'));
 
 const ADMIN_LOGIN_EMAIL = process.env.EXPO_PUBLIC_ADMIN_LOGIN_EMAIL || '';
 const ADMIN_LOGIN_PASSWORD = process.env.EXPO_PUBLIC_ADMIN_LOGIN_PASSWORD || '';
 
 function isAdminEmail(email) {
-  if (!email) return false;
+  if (!email || ADMIN_EMAILS.length === 0) return false;
   return ADMIN_EMAILS.includes(email.trim().toLowerCase());
 }
 

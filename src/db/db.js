@@ -624,8 +624,8 @@ async function getConsistencyScore() {
 }
 
 function rarityFromConsistency(count) {
-  if (count >= 10) return 'mythic';
-  if (count >= 6) return 'rare';
+  if (count >= 7) return 'mythic';
+  if (count >= 5) return 'rare';
   if (count >= 3) return 'uncommon';
   return 'common';
 }
