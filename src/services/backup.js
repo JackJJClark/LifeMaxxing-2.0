@@ -57,9 +57,8 @@ export async function signOut() {
   }
 }
 
-export async function saveBackup() {
+export async function saveBackupPayload(payload) {
   const session = await requireSession();
-  const payload = await exportAllData();
   const record = {
     user_id: session.user.id,
     payload,
@@ -74,7 +73,12 @@ export async function saveBackup() {
   return record;
 }
 
-export async function loadBackup() {
+export async function saveBackup() {
+  const payload = await exportAllData();
+  return saveBackupPayload(payload);
+}
+
+export async function fetchBackupPayload() {
   const session = await requireSession();
   const { data, error } = await supabase
     .from(BACKUP_TABLE)
@@ -87,6 +91,11 @@ export async function loadBackup() {
   if (!data || !data.payload) {
     throw new Error('No backup found.');
   }
+  return data;
+}
+
+export async function loadBackup() {
+  const data = await fetchBackupPayload();
   await clearAllData();
   await importAllData(data.payload);
   await touchLastActive();

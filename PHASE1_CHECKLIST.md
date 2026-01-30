@@ -9,6 +9,7 @@ Source: Lifemaxxing PRD v1.4 (Build-Authoritative)
 
 ## Systems
 - [x] Local-first identity (offline authoritative)
+- [x] Web app (localStorage persistence)
 - [x] Guest mode (no auth required)
 - [x] Habits / effort anchors (create, select, pause)
 - [x] Effort self-reporting (magnitude, optional note)
@@ -39,7 +40,6 @@ Source: Lifemaxxing PRD v1.4 (Build-Authoritative)
 ## Explicit Exclusions
 - [x] Social features
 - [x] Leaderboards / PvP
-- [x] Web app
 - [x] Competitive metrics
 - [x] Cosmetic currency
 

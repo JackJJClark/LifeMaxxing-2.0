@@ -39,10 +39,17 @@ function loadWebStore() {
       ? data.combatEncounters
       : [];
     webStore.mercyEvents = Array.isArray(data.mercyEvents) ? data.mercyEvents : [];
-    webStore.habitEffortCache =
-      data.habitEffortCache && typeof data.habitEffortCache === 'object'
-        ? data.habitEffortCache
-        : {};
+    if (Array.isArray(data.habitEffortCache)) {
+      webStore.habitEffortCache = Object.fromEntries(
+        data.habitEffortCache
+          .filter((record) => record && record.habitKey)
+          .map((record) => [record.habitKey, record])
+      );
+    } else if (data.habitEffortCache && typeof data.habitEffortCache === 'object') {
+      webStore.habitEffortCache = data.habitEffortCache;
+    } else {
+      webStore.habitEffortCache = {};
+    }
   } catch (error) {
     // Ignore storage errors.
   }
@@ -196,43 +203,43 @@ const HABIT_PREVALENCE = [
     key: 'exercise',
     keywords: ['gym', 'lift', 'strength', 'weights', 'workout', 'exercise', 'cardio', 'run', 'cycle'],
     prevalence: 47.3,
-    source: 'cdc_aerobic_2022',
+    source: 'cdc_aerobic_guidelines_2022',
   },
   {
     key: 'sleep',
     keywords: ['sleep', 'bed', 'rest'],
     prevalence: 65.0,
-    source: 'cdc_sleep_2020',
+    source: 'cdc_sleep_2020_inferred',
   },
   {
     key: 'water',
     keywords: ['water', 'hydrate', 'hydration'],
     prevalence: 81.4,
-    source: 'nhanes_water_2011_2014',
+    source: 'nhanes_plain_water_2011_2014',
   },
   {
     key: 'meditation',
     keywords: ['meditate', 'meditation', 'mindfulness'],
     prevalence: 14.2,
-    source: 'nccih_meditation_2017',
+    source: 'nchs_meditation_2017',
   },
   {
     key: 'yoga',
     keywords: ['yoga'],
     prevalence: 14.3,
-    source: 'cdc_yoga_2017',
+    source: 'nchs_yoga_2017',
   },
   {
     key: 'vegetables',
     keywords: ['vegetable', 'veggies', 'greens', 'salad'],
     prevalence: 10.0,
-    source: 'cdc_fruit_veg_2019',
+    source: 'cdc_veg_recommendation_2019',
   },
   {
     key: 'fruit',
     keywords: ['fruit', 'berries', 'apple', 'banana'],
     prevalence: 12.3,
-    source: 'cdc_fruit_veg_2019',
+    source: 'cdc_fruit_recommendation_2019',
   },
 ];
 
@@ -370,6 +377,7 @@ export async function getHabitEffortForName(habitName) {
     const matched = matchPrevalence(habitName);
     const effort = effortFromPrevalence(matched.prevalence);
     const record = {
+      habitKey,
       effort,
       prevalence: matched.prevalence,
       source: matched.source,
@@ -390,6 +398,7 @@ export async function getHabitEffortForName(habitName) {
   const matched = matchPrevalence(habitName);
   const effort = effortFromPrevalence(matched.prevalence);
   const record = {
+    habitKey,
     effort,
     prevalence: matched.prevalence,
     source: matched.source,
@@ -510,6 +519,24 @@ export async function listHabits() {
     items.push(result.rows.item(i));
   }
   return items;
+}
+
+async function getHabitNameById(habitId) {
+  if (!habitId) return '';
+  if (isWeb) {
+    const habit = webStore.habits.find((item) => item.id === habitId);
+    return habit ? habit.name : '';
+  }
+  const result = await execSql('SELECT name FROM habits WHERE id = ? LIMIT 1', [habitId]);
+  if (result.rows.length === 0) return '';
+  return result.rows.item(0).name || '';
+}
+
+async function resolveEffortValue(habitId, fallbackName) {
+  const habitName = fallbackName || (await getHabitNameById(habitId));
+  if (!habitName) return 5;
+  const info = await getHabitEffortForName(habitName);
+  return info?.effort || 5;
 }
 
 export async function createHabit(name) {
@@ -667,12 +694,13 @@ export async function logEffort({ habitId, effortValue, note }) {
   const id = makeId('effort');
   const timestamp = nowIso();
   const inactivityDays = await getInactivityDays();
+  const resolvedEffort = await resolveEffortValue(habitId);
 
   if (isWeb) {
     webStore.effortLogs.push({
       id,
       habitId,
-      effortValue,
+      effortValue: resolvedEffort,
       note: note || null,
       timestamp,
       createdAt: timestamp,
@@ -680,11 +708,11 @@ export async function logEffort({ habitId, effortValue, note }) {
   } else {
     await execSql(
       'INSERT INTO effort_logs (id, habitId, effortValue, note, timestamp, createdAt) VALUES (?, ?, ?, ?, ?, ?)',
-      [id, habitId, effortValue, note || null, timestamp, timestamp]
+      [id, habitId, resolvedEffort, note || null, timestamp, timestamp]
     );
   }
 
-  await updateIdentityTotals(effortValue);
+  await updateIdentityTotals(resolvedEffort);
 
   const consistency = await getConsistencyScore();
   const chestId = makeId('chest');
@@ -1111,7 +1139,9 @@ export async function importAllData(payload) {
     webStore.mercyEvents = payload.mercyEvents ? [...payload.mercyEvents] : [];
     const cache = payload.habitEffortCache ? [...payload.habitEffortCache] : [];
     webStore.habitEffortCache = Object.fromEntries(
-      cache.map((record) => [record.habitKey, record])
+      cache
+        .filter((record) => record && record.habitKey)
+        .map((record) => [record.habitKey, record])
     );
     saveWebStore();
     return;

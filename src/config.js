@@ -10,8 +10,16 @@ const ADMIN_EMAILS = ADMIN_EMAILS_RAW
   .map((value) => value.trim().toLowerCase())
   .filter((value) => value.includes('@'));
 
-const ADMIN_LOGIN_EMAIL = process.env.EXPO_PUBLIC_ADMIN_LOGIN_EMAIL || '';
-const ADMIN_LOGIN_PASSWORD = process.env.EXPO_PUBLIC_ADMIN_LOGIN_PASSWORD || '';
+const SENTRY_DSN = process.env.EXPO_PUBLIC_SENTRY_DSN || '';
+const SENTRY_TRACES_SAMPLE_RATE_RAW =
+  process.env.EXPO_PUBLIC_SENTRY_TRACES_SAMPLE_RATE || '';
+const SENTRY_TRACES_SAMPLE_RATE = Number.parseFloat(SENTRY_TRACES_SAMPLE_RATE_RAW || '0');
+
+const POSTHOG_API_KEY = process.env.EXPO_PUBLIC_POSTHOG_API_KEY || '';
+const POSTHOG_HOST = process.env.EXPO_PUBLIC_POSTHOG_HOST || '';
+
+const TURNSTILE_SITE_KEY = process.env.EXPO_PUBLIC_TURNSTILE_SITE_KEY || '';
+
 
 function isAdminEmail(email) {
   if (!email || ADMIN_EMAILS.length === 0) return false;
@@ -22,7 +30,10 @@ export {
   SUPABASE_URL,
   SUPABASE_PUBLISHABLE_KEY,
   ADMIN_EMAILS,
-  ADMIN_LOGIN_EMAIL,
-  ADMIN_LOGIN_PASSWORD,
+  SENTRY_DSN,
+  SENTRY_TRACES_SAMPLE_RATE,
+  POSTHOG_API_KEY,
+  POSTHOG_HOST,
+  TURNSTILE_SITE_KEY,
   isAdminEmail,
 };

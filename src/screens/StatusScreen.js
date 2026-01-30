@@ -1,16 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { StyleSheet, Text, View, Pressable, TextInput, ScrollView, Platform, Image } from 'react-native';
-import { ADMIN_EMAILS, isAdminEmail } from '../config';
+import { ADMIN_EMAILS, TURNSTILE_SITE_KEY, isAdminEmail } from '../config';
 import { supabase } from '../services/supabase';
 import {
   signInWithPassword,
   signUpWithPassword,
   signOut,
-  saveBackup,
-  loadBackup,
+  saveBackupPayload,
   listBackups,
   fetchBackupForUserId,
-  loadBackupForUserId,
+  fetchBackupPayload,
 } from '../services/backup';
 import {
   createHabit,
@@ -29,6 +28,7 @@ import {
   listRecentEfforts,
   exportAllData,
   importAllData,
+  touchLastActive,
   logEffort,
   resolveCombatEncounter,
   setHabitActive,
@@ -39,7 +39,7 @@ import {
 const TOP_BAR_HEIGHT = Platform.OS === 'web' ? 80 : 88;
 const BRAND_BOX_SIZE = Platform.OS === 'web' ? 56 : 64;
 const BRAND_LOGO_SIZE = Platform.OS === 'web' ? 44 : 52;
-const EMAIL_AUTH_ENABLED = false;
+const EMAIL_AUTH_ENABLED = true;
 const FONT = {
   xs: 11,
   sm: 12,
@@ -49,13 +49,175 @@ const FONT = {
   hero: 36,
 };
 const ACCENT_GOLD = '#f6c46a';
-const ACCENT_GOLD = '#f6c46a';
+const ENCRYPTION_VERSION = 1;
+const TURNSTILE_SCRIPT_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+
+function TurnstileWidget({ onToken, onError }) {
+  const containerRef = useRef(null);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || !TURNSTILE_SITE_KEY) return undefined;
+    if (typeof window === 'undefined' || typeof document === 'undefined') return undefined;
+    let mounted = true;
+    let widgetId = null;
+
+    const loadScript = () => {
+      if (window.turnstile) return Promise.resolve();
+      const existing = document.querySelector('script[data-turnstile]');
+      if (existing) {
+        return new Promise((resolve, reject) => {
+          existing.addEventListener('load', resolve, { once: true });
+          existing.addEventListener('error', reject, { once: true });
+        });
+      }
+      return new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = TURNSTILE_SCRIPT_SRC;
+        script.async = true;
+        script.defer = true;
+        script.dataset.turnstile = 'true';
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error('Turnstile script failed to load.'));
+        document.head.appendChild(script);
+      });
+    };
+
+    const renderWidget = async () => {
+      try {
+        await loadScript();
+        if (!mounted || !window.turnstile || !containerRef.current) return;
+        widgetId = window.turnstile.render(containerRef.current, {
+          sitekey: TURNSTILE_SITE_KEY,
+          callback: (token) => {
+            if (onToken) onToken(token);
+          },
+          'error-callback': () => {
+            if (onError) onError('Turnstile error.');
+          },
+          'expired-callback': () => {
+            if (onToken) onToken('');
+          },
+        });
+      } catch (error) {
+        if (onError) onError(error?.message || 'Turnstile error.');
+      }
+    };
+
+    renderWidget();
+
+    return () => {
+      mounted = false;
+      if (window.turnstile && widgetId !== null) {
+        try {
+          window.turnstile.remove(widgetId);
+        } catch (error) {
+          // Ignore cleanup errors.
+        }
+      }
+    };
+  }, [onError, onToken]);
+
+  if (Platform.OS !== 'web' || !TURNSTILE_SITE_KEY) return null;
+  return <View ref={containerRef} style={styles.turnstileContainer} />;
+}
+
+function canUseWebCrypto() {
+  return (
+    typeof window !== 'undefined' &&
+    window.crypto &&
+    window.crypto.subtle &&
+    typeof TextEncoder !== 'undefined' &&
+    typeof TextDecoder !== 'undefined'
+  );
+}
+
+function isEncryptedPayload(payload) {
+  return (
+    payload &&
+    typeof payload === 'object' &&
+    payload.__encrypted === true &&
+    payload.data &&
+    payload.iv &&
+    payload.salt
+  );
+}
+
+function toBase64(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function fromBase64(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function deriveKey(passphrase, salt) {
+  const encoder = new TextEncoder();
+  const keyMaterial = await window.crypto.subtle.importKey(
+    'raw',
+    encoder.encode(passphrase),
+    'PBKDF2',
+    false,
+    ['deriveKey']
+  );
+  return window.crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt,
+      iterations: 150000,
+      hash: 'SHA-256',
+    },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function encryptPayload(passphrase, payload) {
+  if (!canUseWebCrypto()) {
+    throw new Error('Encryption is available on web only.');
+  }
+  const salt = window.crypto.getRandomValues(new Uint8Array(16));
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(passphrase, salt);
+  const encoder = new TextEncoder();
+  const encoded = encoder.encode(JSON.stringify(payload));
+  const cipherBuffer = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
+  return {
+    __encrypted: true,
+    v: ENCRYPTION_VERSION,
+    alg: 'AES-GCM',
+    salt: toBase64(salt),
+    iv: toBase64(iv),
+    data: toBase64(new Uint8Array(cipherBuffer)),
+  };
+}
+
+async function decryptPayload(passphrase, envelope) {
+  if (!canUseWebCrypto()) {
+    throw new Error('Decryption is available on web only.');
+  }
+  const salt = fromBase64(envelope.salt);
+  const iv = fromBase64(envelope.iv);
+  const data = fromBase64(envelope.data);
+  const key = await deriveKey(passphrase, salt);
+  const plainBuffer = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+  const decoder = new TextDecoder();
+  return JSON.parse(decoder.decode(plainBuffer));
+}
 
 export default function StatusScreen() {
   const SHOW_TRUST_TESTS = true;
   const QUIET_MODE_DAYS = 2;
-  const EFFORT_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-  const EFFORT_PRESETS = [3, 5, 7, 10];
   const BASE_TABS = [
     'Tasks',
     'Inventory',
@@ -77,7 +239,6 @@ export default function StatusScreen() {
   const [effortFilter, setEffortFilter] = useState('all');
   const [effortInfo, setEffortInfo] = useState(null);
   const [effortNote, setEffortNote] = useState('');
-  const [selectedEffort, setSelectedEffort] = useState(null);
   const [habitEfforts, setHabitEfforts] = useState({});
   const [evidence, setEvidence] = useState(null);
   const [combatChest, setCombatChest] = useState(null);
@@ -91,6 +252,7 @@ export default function StatusScreen() {
   const [authEmail, setAuthEmail] = useState('');
   const [adminStatus, setAdminStatus] = useState('unknown');
   const [adminMessage, setAdminMessage] = useState('');
+  const [adminClaim, setAdminClaim] = useState(null);
   const [lastBackupAt, setLastBackupAt] = useState(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
@@ -103,6 +265,10 @@ export default function StatusScreen() {
   const [adminLoading, setAdminLoading] = useState(false);
   const [adminLog, setAdminLog] = useState([]);
   const [activeTab, setActiveTab] = useState('Tasks');
+  const [rlsMessage, setRlsMessage] = useState('');
+  const [backupPassphrase, setBackupPassphrase] = useState('');
+  const [turnstileToken, setTurnstileToken] = useState('');
+  const [turnstileMessage, setTurnstileMessage] = useState('');
 
   const adminEnabled = ADMIN_EMAILS.length > 0;
   const authEnabled = !!supabase;
@@ -157,6 +323,7 @@ export default function StatusScreen() {
       setAuthStatus('disabled');
       setAuthEmail('');
       setAdminStatus(adminEnabled ? 'signed_out' : 'disabled');
+      setAdminClaim(null);
       setLastBackupAt(null);
       if (Platform.OS === 'web' && !onboardingDismissed) {
         setShowOnboarding(true);
@@ -171,6 +338,7 @@ export default function StatusScreen() {
       setAuthStatus('signed_out');
       setAuthEmail('');
       setAdminStatus(adminEnabled ? 'signed_out' : 'disabled');
+      setAdminClaim(null);
       setLastBackupAt(null);
       if (Platform.OS === 'web' && !onboardingDismissed) {
         setShowOnboarding(true);
@@ -179,8 +347,10 @@ export default function StatusScreen() {
       return;
     }
     const sessionEmail = data.session.user?.email || '';
+    const claim = data.session.user?.app_metadata?.is_admin;
     setAuthStatus('signed_in');
     setAuthEmail(sessionEmail);
+    setAdminClaim(typeof claim === 'boolean' ? claim : null);
     if (adminEnabled && isAdminEmail(sessionEmail)) {
       setAdminStatus('signed_in');
     } else {
@@ -254,13 +424,11 @@ export default function StatusScreen() {
     async function loadEffortInfo() {
       if (!selectedHabit) {
         setEffortInfo(null);
-        setSelectedEffort(null);
         return;
       }
       const info = await getHabitEffortForName(selectedHabit.name);
       if (alive) {
         setEffortInfo(info);
-        setSelectedEffort(info.effort);
       }
     }
     loadEffortInfo();
@@ -276,8 +444,44 @@ export default function StatusScreen() {
   }, [showAdminTab, activeTab]);
 
   const isQuietMode = inactivityDays >= QUIET_MODE_DAYS;
+  const turnstileEnabled = Platform.OS === 'web' && !!TURNSTILE_SITE_KEY;
+  const turnstileStatus = turnstileToken ? 'Turnstile token ready.' : turnstileMessage;
 
-  async function handleLogEffort(customHabitId, customHabitName, customEffortValue) {
+  function handleTurnstileToken(token) {
+    setTurnstileToken(token);
+    if (token) {
+      setTurnstileMessage('Turnstile token ready.');
+    } else if (turnstileEnabled) {
+      setTurnstileMessage('Turnstile expired. Complete the check again.');
+    } else {
+      setTurnstileMessage('');
+    }
+  }
+
+  function handleTurnstileError(message) {
+    setTurnstileToken('');
+    setTurnstileMessage(message || 'Turnstile error.');
+  }
+  const hasPassphrase = backupPassphrase.trim().length > 0;
+  const encryptionEnabled = Platform.OS === 'web' && hasPassphrase;
+
+  async function encryptIfNeeded(payload) {
+    if (!hasPassphrase) return payload;
+    if (Platform.OS !== 'web') {
+      throw new Error('Backup encryption is available on web only.');
+    }
+    return encryptPayload(backupPassphrase, payload);
+  }
+
+  async function decryptIfNeeded(payload) {
+    if (!isEncryptedPayload(payload)) return payload;
+    if (!hasPassphrase) {
+      throw new Error('Passphrase required to decrypt this backup.');
+    }
+    return decryptPayload(backupPassphrase, payload);
+  }
+
+  async function handleLogEffort(customHabitId, customHabitName) {
     const targetHabitId = customHabitId || habitId;
     if (!targetHabitId) return;
     const targetHabit = customHabitName
@@ -286,24 +490,18 @@ export default function StatusScreen() {
     if (!targetHabit || !targetHabit.isActive) {
       return;
     }
-    const effortInfo = await getHabitEffortForName(targetHabit.name);
-    const resolvedEffort =
-      typeof customEffortValue === 'number'
-        ? customEffortValue
-        : typeof selectedEffort === 'number'
-        ? selectedEffort
-        : effortInfo?.effort || 5;
     const cleanedNote = effortNote.trim();
     const result = await logEffort({
       habitId: targetHabitId,
-      effortValue: resolvedEffort,
       note: cleanedNote.length ? cleanedNote : null,
     });
     await refresh();
     setEffortNote('');
     if (authStatus === 'signed_in') {
       try {
-        const record = await saveBackup();
+        const payload = await exportAllData();
+        const encryptedPayload = await encryptIfNeeded(payload);
+        const record = await saveBackupPayload(encryptedPayload);
         setLastBackupAt(record.updated_at);
       } catch (error) {
         setAccountMessage(error?.message || 'Auto-backup failed.');
@@ -333,6 +531,7 @@ export default function StatusScreen() {
       setAccountMessage('Account linking is not enabled.');
       return;
     }
+    setTurnstileMessage('');
     setAdminBusy(true);
     setAccountMessage('');
     setAdminMessage('');
@@ -340,10 +539,18 @@ export default function StatusScreen() {
       await signInWithPassword(loginEmail.trim(), loginPassword);
       await refreshAuthStatus();
       try {
-        const record = await loadBackup();
+        const record = await fetchBackupPayload();
+        const decrypted = await decryptIfNeeded(record.payload);
+        await clearAllData();
+        await importAllData(decrypted);
+        await touchLastActive();
         setLastBackupAt(record.updated_at);
         await refresh();
-        setAccountMessage('Signed in. Latest backup loaded.');
+        setAccountMessage(
+          isEncryptedPayload(record.payload)
+            ? 'Signed in. Encrypted backup loaded.'
+            : 'Signed in. Latest backup loaded.'
+        );
       } catch (error) {
         setAccountMessage(error?.message || 'Signed in. No backup found.');
       }
@@ -400,9 +607,13 @@ export default function StatusScreen() {
     setAccountMessage('');
     setAdminMessage('');
     try {
-      const record = await saveBackup();
+      const payload = await exportAllData();
+      const encryptedPayload = await encryptIfNeeded(payload);
+      const record = await saveBackupPayload(encryptedPayload);
       setLastBackupAt(record.updated_at);
-      const message = `Backup saved (${new Date(record.updated_at).toLocaleString()}).`;
+      const message = `Backup saved (${new Date(record.updated_at).toLocaleString()}).${
+        isEncryptedPayload(encryptedPayload) ? ' Encrypted.' : ''
+      }`;
       setAccountMessage(message);
       setAdminMessage(message);
       setAdminLog((prev) => [
@@ -428,10 +639,16 @@ export default function StatusScreen() {
     setAccountMessage('');
     setAdminMessage('');
     try {
-      const record = await loadBackup();
+      const record = await fetchBackupPayload();
+      const decrypted = await decryptIfNeeded(record.payload);
+      await clearAllData();
+      await importAllData(decrypted);
+      await touchLastActive();
       setLastBackupAt(record.updated_at);
       await refresh();
-      const message = `Backup loaded (${new Date(record.updated_at).toLocaleString()}).`;
+      const message = `Backup loaded (${new Date(record.updated_at).toLocaleString()}).${
+        isEncryptedPayload(record.payload) ? ' Decrypted.' : ''
+      }`;
       setAccountMessage(message);
       setAdminMessage(message);
       setAdminLog((prev) => [
@@ -486,16 +703,31 @@ export default function StatusScreen() {
       const data = await fetchBackupForUserId(adminSelectedUserId);
       const payload = data.payload || {};
       const payloadBytes = JSON.stringify(payload).length;
-      setAdminSummary({
-        updatedAt: data.updated_at,
-        identityLevel: payload.identity?.level || 0,
-        totalEffort: payload.identity?.totalEffortUnits || 0,
-        habits: payload.habits?.length || 0,
-        efforts: payload.effortLogs?.length || 0,
-        chests: payload.chests?.length || 0,
-        items: payload.items?.length || 0,
-        payloadBytes,
-      });
+      if (isEncryptedPayload(payload)) {
+        setAdminSummary({
+          updatedAt: data.updated_at,
+          identityLevel: 0,
+          totalEffort: 0,
+          habits: 0,
+          efforts: 0,
+          chests: 0,
+          items: 0,
+          payloadBytes,
+          encrypted: true,
+        });
+      } else {
+        setAdminSummary({
+          updatedAt: data.updated_at,
+          identityLevel: payload.identity?.level || 0,
+          totalEffort: payload.identity?.totalEffortUnits || 0,
+          habits: payload.habits?.length || 0,
+          efforts: payload.effortLogs?.length || 0,
+          chests: payload.chests?.length || 0,
+          items: payload.items?.length || 0,
+          payloadBytes,
+          encrypted: false,
+        });
+      }
       setAdminLog((prev) => [
         { label: 'Previewed backup', at: new Date().toISOString() },
         ...prev,
@@ -516,9 +748,17 @@ export default function StatusScreen() {
     setAdminLoading(true);
     setAdminMessage('');
     try {
-      const record = await loadBackupForUserId(adminSelectedUserId);
+      const record = await fetchBackupForUserId(adminSelectedUserId);
+      const decrypted = await decryptIfNeeded(record.payload);
+      await clearAllData();
+      await importAllData(decrypted);
+      await touchLastActive();
       await refresh();
-      setAdminMessage(`Loaded backup (${new Date(record.updated_at).toLocaleString()}).`);
+      setAdminMessage(
+        `Loaded backup (${new Date(record.updated_at).toLocaleString()}).${
+          isEncryptedPayload(record.payload) ? ' Decrypted.' : ''
+        }`
+      );
       setAdminLog((prev) => [
         { label: 'Loaded backup to device', at: new Date().toISOString() },
         ...prev,
@@ -615,11 +855,38 @@ export default function StatusScreen() {
     await refresh();
   }
 
+  async function handleVerifyRls() {
+    if (!authEnabled) {
+      setRlsMessage('Supabase is not configured.');
+      return;
+    }
+    setAdminLoading(true);
+    setRlsMessage('');
+    try {
+      const { data, error } = await supabase
+        .from('lifemaxing_backups')
+        .select('user_id')
+        .limit(1);
+      if (error) {
+        setRlsMessage('RLS blocked the query (expected for non-admin).');
+      } else if (data && data.length > 0) {
+        setRlsMessage(`RLS allowed select. Rows visible: ${data.length}.`);
+      } else {
+        setRlsMessage('RLS allowed select, but no rows visible.');
+      }
+    } catch (error) {
+      setRlsMessage(error?.message || 'RLS check failed.');
+    } finally {
+      setAdminLoading(false);
+    }
+  }
+
   async function handleAccountSignUp() {
     if (!authEnabled || !EMAIL_AUTH_ENABLED) {
       setAccountMessage('Account linking is not enabled.');
       return;
     }
+    setTurnstileMessage('');
     setAdminBusy(true);
     setAccountMessage('');
     setAdminMessage('');
@@ -687,7 +954,10 @@ export default function StatusScreen() {
     }
     try {
       const payload = await exportAllData();
-      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const encryptedPayload = await encryptIfNeeded(payload);
+      const blob = new Blob([JSON.stringify(encryptedPayload, null, 2)], {
+        type: 'application/json',
+      });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
@@ -695,7 +965,9 @@ export default function StatusScreen() {
       link.download = `lifemaxing_export_${stamp}.json`;
       link.click();
       URL.revokeObjectURL(url);
-      setAccountMessage('Local data exported.');
+      setAccountMessage(
+        isEncryptedPayload(encryptedPayload) ? 'Local data exported (encrypted).' : 'Local data exported.'
+      );
     } catch (error) {
       setAccountMessage(error?.message || 'Export failed.');
     }
@@ -716,10 +988,13 @@ export default function StatusScreen() {
       reader.onload = async () => {
         try {
           const payload = JSON.parse(reader.result);
+          const decrypted = await decryptIfNeeded(payload);
           await clearAllData();
-          await importAllData(payload);
+          await importAllData(decrypted);
           await refresh();
-          setAccountMessage('Local data imported.');
+          setAccountMessage(
+            isEncryptedPayload(payload) ? 'Local data imported (decrypted).' : 'Local data imported.'
+          );
         } catch (error) {
           setAccountMessage(error?.message || 'Import failed.');
         }
@@ -960,6 +1235,11 @@ export default function StatusScreen() {
           {adminStatus === 'signed_in' ? (
             <Text style={styles.subtle}>Admin access enabled.</Text>
           ) : null}
+          {authStatus === 'signed_in' ? (
+            <Text style={styles.subtle}>
+              Admin claim: {adminClaim === null ? 'Not present' : adminClaim ? 'true' : 'false'}
+            </Text>
+          ) : null}
           {authStatus === 'disabled' ? (
             <Text style={styles.subtle}>Account linking is not configured.</Text>
           ) : null}
@@ -989,6 +1269,17 @@ export default function StatusScreen() {
                 style={styles.input}
                 secureTextEntry
               />
+              {turnstileEnabled ? (
+                <>
+                  <TurnstileWidget
+                    onToken={handleTurnstileToken}
+                    onError={handleTurnstileError}
+                  />
+                  {turnstileStatus ? (
+                    <Text style={styles.subtle}>{turnstileStatus}</Text>
+                  ) : null}
+                </>
+              ) : null}
               <Pressable
                 style={styles.button}
                 onPress={handleAccountSignIn}
@@ -1027,6 +1318,26 @@ export default function StatusScreen() {
               >
                 <Text style={styles.buttonGhostText}>Load backup to this device</Text>
               </Pressable>
+              {Platform.OS === 'web' ? (
+                <View style={styles.menuSection}>
+                  <Text style={styles.menuLabel}>Backup Encryption</Text>
+                  <TextInput
+                    value={backupPassphrase}
+                    onChangeText={setBackupPassphrase}
+                    placeholder="Passphrase (optional)"
+                    placeholderTextColor="#4b5563"
+                    style={styles.input}
+                    secureTextEntry
+                  />
+                  <Text style={styles.subtle}>
+                    {encryptionEnabled
+                      ? 'Encrypting backups on this device.'
+                      : 'Leave blank to save unencrypted backups.'}
+                  </Text>
+                </View>
+              ) : (
+                <Text style={styles.subtle}>Backup encryption is available on web only.</Text>
+              )}
             </View>
           ) : null}
           <View style={styles.menuSection}>
@@ -1057,6 +1368,9 @@ export default function StatusScreen() {
           <Text style={styles.subtle}>
             Server must enforce RLS. Client checks alone are not sufficient.
           </Text>
+          <Text style={styles.subtle}>
+            Admin email list only gates UI visibility, not data access.
+          </Text>
           {adminStatus === 'disabled' ? (
             <Text style={styles.subtle}>Admin tools are disabled.</Text>
           ) : null}
@@ -1066,6 +1380,14 @@ export default function StatusScreen() {
           {adminStatus === 'signed_in' ? (
             <>
               <Text style={styles.subtle}>Backups (Supabase)</Text>
+              <Pressable
+                style={styles.buttonGhost}
+                onPress={handleVerifyRls}
+                disabled={adminLoading}
+              >
+                <Text style={styles.buttonGhostText}>Verify RLS</Text>
+              </Pressable>
+              {rlsMessage ? <Text style={styles.subtle}>{rlsMessage}</Text> : null}
               <View style={styles.habitInputRow}>
                 <TextInput
                   value={adminFilter}
@@ -1139,6 +1461,11 @@ export default function StatusScreen() {
           {adminSummary ? (
             <View style={styles.panelQuiet}>
               <Text style={styles.panelTitle}>Summary</Text>
+              {adminSummary.encrypted ? (
+                <Text style={styles.subtle}>
+                  Encrypted backup. Provide the passphrase to load it on this device.
+                </Text>
+              ) : null}
               <View style={styles.statRow}>
                 <Text style={styles.statLabel}>Identity Level</Text>
                 <Text style={styles.statValue}>{adminSummary.identityLevel}</Text>
@@ -1240,42 +1567,18 @@ export default function StatusScreen() {
           )}
           <View style={styles.menuDivider} />
           <Text style={styles.panelTitle}>Log Effort</Text>
-          <View style={styles.effortPresetRow}>
-            {EFFORT_PRESETS.map((value) => (
-              <Pressable
-                key={`preset-${value}`}
-                style={[
-                  styles.effortPreset,
-                  selectedEffort === value && styles.effortPresetActive,
-                ]}
-                onPress={() => setSelectedEffort(value)}
-              >
-                <Text style={styles.filterText}>{value}</Text>
-              </Pressable>
-            ))}
-          </View>
           {selectedHabit ? (
             <>
               <Text style={styles.subtle}>
                 Selected: {selectedHabit.name} {selectedHabit.isActive ? '' : '(paused)'}
               </Text>
               <Text style={styles.subtle}>
-                Suggested effort: {effortInfo ? `${effortInfo.effort}/10` : '...'}
+                Effort auto-calculated from US prevalence:
+                {effortInfo ? ` ${effortInfo.effort}/10` : ' ...'}
               </Text>
-              <View style={styles.effortRow}>
-                {EFFORT_OPTIONS.map((value) => (
-                  <Pressable
-                    key={`effort-${value}`}
-                    style={[
-                      styles.effortChip,
-                      selectedEffort === value && styles.effortChipSelected,
-                    ]}
-                    onPress={() => setSelectedEffort(value)}
-                  >
-                    <Text style={styles.effortText}>{value}</Text>
-                  </Pressable>
-                ))}
-              </View>
+              <Text style={styles.subtle}>
+                This value is fixed by habit prevalence to keep effort consistent.
+              </Text>
               <TextInput
                 value={effortNote}
                 onChangeText={setEffortNote}
@@ -1490,6 +1793,17 @@ export default function StatusScreen() {
                     style={styles.input}
                     secureTextEntry
                   />
+                  {turnstileEnabled ? (
+                    <>
+                      <TurnstileWidget
+                        onToken={handleTurnstileToken}
+                        onError={handleTurnstileError}
+                      />
+                      {turnstileStatus ? (
+                        <Text style={styles.subtle}>{turnstileStatus}</Text>
+                      ) : null}
+                    </>
+                  ) : null}
                   <Pressable
                     style={styles.button}
                     onPress={handleAccountSignIn}
@@ -1544,6 +1858,17 @@ export default function StatusScreen() {
                     style={styles.input}
                     secureTextEntry
                   />
+                  {turnstileEnabled ? (
+                    <>
+                      <TurnstileWidget
+                        onToken={handleTurnstileToken}
+                        onError={handleTurnstileError}
+                      />
+                      {turnstileStatus ? (
+                        <Text style={styles.subtle}>{turnstileStatus}</Text>
+                      ) : null}
+                    </>
+                  ) : null}
                   <Pressable
                     style={styles.button}
                     onPress={handleAccountSignUp}
@@ -2438,5 +2763,11 @@ const styles = StyleSheet.create({
     color: '#eaf4ff',
     fontSize: 12,
     fontWeight: '700',
+  },
+  turnstileContainer: {
+    alignSelf: 'stretch',
+    minHeight: 70,
+    marginTop: 8,
+    marginBottom: 4,
   },
 });
