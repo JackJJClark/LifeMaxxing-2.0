@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { StyleSheet, Text, View, Pressable, TextInput, ScrollView, Platform, Image } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { ADMIN_EMAILS, TURNSTILE_SITE_KEY, isAdminEmail } from '../config';
 import { supabase } from '../services/supabase';
 import {
@@ -8,6 +9,19 @@ import {
   signOut,
   saveBackupPayload,
   listBackups,
+  listBackupHistory,
+  upsertUserProfile,
+  listUserProfiles,
+  listBackupSummaries,
+  listSystemEvents,
+  listAdminAudit,
+  logSystemEvent,
+  logAdminAction,
+  deleteUserBackup,
+  deleteUserBackupHistory,
+  deleteUserSummary,
+  deleteUserProfile,
+  deleteUserSystemEvents,
   fetchBackupForUserId,
   fetchBackupPayload,
 } from '../services/backup';
@@ -51,6 +65,7 @@ const FONT = {
 const ACCENT_GOLD = '#f6c46a';
 const ENCRYPTION_VERSION = 1;
 const TURNSTILE_SCRIPT_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+const BACKUP_HISTORY_KEY = 'lifemaxing.backupHistory.v1';
 
 function TurnstileWidget({ onToken, onError }) {
   const containerRef = useRef(null);
@@ -129,6 +144,10 @@ function canUseWebCrypto() {
     typeof TextEncoder !== 'undefined' &&
     typeof TextDecoder !== 'undefined'
   );
+}
+
+function canUseWebStorage() {
+  return typeof window !== 'undefined' && window.localStorage;
 }
 
 function isEncryptedPayload(payload) {
@@ -262,6 +281,28 @@ export default function StatusScreen() {
   const [adminFilter, setAdminFilter] = useState('');
   const [adminSelectedUserId, setAdminSelectedUserId] = useState('');
   const [adminSummary, setAdminSummary] = useState(null);
+  const [adminHistory, setAdminHistory] = useState([]);
+  const [adminUsers, setAdminUsers] = useState([]);
+  const [adminUserSearch, setAdminUserSearch] = useState('');
+  const [adminUserIdSearch, setAdminUserIdSearch] = useState('');
+  const [adminSummaries, setAdminSummaries] = useState([]);
+  const [adminEvents, setAdminEvents] = useState([]);
+  const [adminAudit, setAdminAudit] = useState([]);
+  const [adminUserLimit, setAdminUserLimit] = useState(50);
+  const [adminSummaryLimit, setAdminSummaryLimit] = useState(50);
+  const [adminEventsLimit, setAdminEventsLimit] = useState(25);
+  const [adminAuditLimit, setAdminAuditLimit] = useState(25);
+  const [adminUserPage, setAdminUserPage] = useState(0);
+  const [adminEventsPage, setAdminEventsPage] = useState(0);
+  const [adminAuditPage, setAdminAuditPage] = useState(0);
+  const [adminDateFrom, setAdminDateFrom] = useState('');
+  const [adminDateTo, setAdminDateTo] = useState('');
+  const [adminTab, setAdminTab] = useState('Overview');
+  const [helpTab, setHelpTab] = useState('Account');
+  const [backupPreview, setBackupPreview] = useState(null);
+  const [backupPreviewPayload, setBackupPreviewPayload] = useState(null);
+  const [backupConflict, setBackupConflict] = useState(null);
+  const [backupHistory, setBackupHistory] = useState([]);
   const [adminLoading, setAdminLoading] = useState(false);
   const [adminLog, setAdminLog] = useState([]);
   const [activeTab, setActiveTab] = useState('Tasks');
@@ -278,6 +319,8 @@ export default function StatusScreen() {
     if (showAdminTab) tabs.push('Admin');
     return tabs;
   }, [showAdminTab]);
+  const ADMIN_TABS = ['Overview', 'Backups', 'Logs'];
+  const HELP_TABS = ['Account', 'Backups', 'Local', 'Onboarding', 'Trust'];
 
   async function refresh() {
     const snap = await getStatusSnapshot();
@@ -325,6 +368,7 @@ export default function StatusScreen() {
       setAdminStatus(adminEnabled ? 'signed_out' : 'disabled');
       setAdminClaim(null);
       setLastBackupAt(null);
+      await refreshBackupHistory();
       if (Platform.OS === 'web' && !onboardingDismissed) {
         setShowOnboarding(true);
         setOnboardingStep('login');
@@ -340,6 +384,7 @@ export default function StatusScreen() {
       setAdminStatus(adminEnabled ? 'signed_out' : 'disabled');
       setAdminClaim(null);
       setLastBackupAt(null);
+      await refreshBackupHistory();
       if (Platform.OS === 'web' && !onboardingDismissed) {
         setShowOnboarding(true);
         setOnboardingStep('login');
@@ -356,6 +401,12 @@ export default function StatusScreen() {
     } else {
       setAdminStatus(adminEnabled ? 'signed_out' : 'disabled');
     }
+    try {
+      await upsertUserProfile({ email: sessionEmail });
+    } catch (error) {
+      // Ignore profile sync errors.
+    }
+    await refreshBackupHistory();
     setShowOnboarding(false);
   }
 
@@ -367,6 +418,7 @@ export default function StatusScreen() {
       if (!alive) return;
       await refresh();
       await refreshAuthStatus();
+      await refreshBackupHistory();
       setLoading(false);
     }
 
@@ -443,6 +495,12 @@ export default function StatusScreen() {
     }
   }, [showAdminTab, activeTab]);
 
+  useEffect(() => {
+    if (showAdminTab && activeTab === 'Admin') {
+      handleRefreshAdminOverview();
+    }
+  }, [showAdminTab, activeTab]);
+
   const isQuietMode = inactivityDays >= QUIET_MODE_DAYS;
   const turnstileEnabled = Platform.OS === 'web' && !!TURNSTILE_SITE_KEY;
   const turnstileStatus = turnstileToken ? 'Turnstile token ready.' : turnstileMessage;
@@ -465,6 +523,13 @@ export default function StatusScreen() {
   const hasPassphrase = backupPassphrase.trim().length > 0;
   const encryptionEnabled = Platform.OS === 'web' && hasPassphrase;
 
+  function ensureTurnstileReady() {
+    if (!turnstileEnabled) return true;
+    if (turnstileToken) return true;
+    setTurnstileMessage('Complete the Turnstile check to continue.');
+    return false;
+  }
+
   async function encryptIfNeeded(payload) {
     if (!hasPassphrase) return payload;
     if (Platform.OS !== 'web') {
@@ -479,6 +544,157 @@ export default function StatusScreen() {
       throw new Error('Passphrase required to decrypt this backup.');
     }
     return decryptPayload(backupPassphrase, payload);
+  }
+
+  function summarizeBackupPayload(payload, updatedAt) {
+    let payloadBytes = 0;
+    try {
+      payloadBytes = JSON.stringify(payload).length;
+    } catch (error) {
+      payloadBytes = 0;
+    }
+    const meta = payload && typeof payload === 'object' ? payload.meta || null : null;
+    if (!payload || typeof payload !== 'object') {
+      return {
+        updatedAt,
+        identityLevel: 0,
+        totalEffort: 0,
+        habits: 0,
+        efforts: 0,
+        chests: 0,
+        items: 0,
+        payloadBytes,
+        encrypted: false,
+        meta,
+      };
+    }
+    return {
+      updatedAt,
+      identityLevel: payload.identity?.level || 0,
+      totalEffort: payload.identity?.totalEffortUnits || 0,
+      habits: payload.habits?.length || 0,
+      efforts: payload.effortLogs?.length || 0,
+      chests: payload.chests?.length || 0,
+      items: payload.items?.length || 0,
+      payloadBytes,
+      encrypted: false,
+      meta,
+    };
+  }
+
+  function buildBackupSummary(payload, payloadBytes = 0) {
+    const meta = payload?.meta || null;
+    return {
+      identityLevel: payload?.identity?.level || 0,
+      totalEffort: payload?.identity?.totalEffortUnits || 0,
+      habits: payload?.habits?.length || 0,
+      efforts: payload?.effortLogs?.length || 0,
+      chests: payload?.chests?.length || 0,
+      items: payload?.items?.length || 0,
+      lastActiveAt: payload?.identity?.lastActiveAt || null,
+      payloadBytes,
+      deviceId: meta?.deviceId || null,
+      appVersion: meta?.appVersion || null,
+    };
+  }
+
+  function normalizeBackupHistory(list) {
+    if (!Array.isArray(list)) return [];
+    return list
+      .filter((entry) => entry && entry.updatedAt)
+      .map((entry) => ({
+        updatedAt: entry.updatedAt,
+        deviceId: entry.deviceId || null,
+        appVersion: entry.appVersion || null,
+      }))
+      .slice(0, 5);
+  }
+
+  function mergeBackupHistory(remoteList, localList) {
+    const combined = [...(remoteList || []), ...(localList || [])];
+    const normalized = normalizeBackupHistory(combined);
+    return normalized.filter(
+      (item, index, list) =>
+        index === list.findIndex((existing) => existing.updatedAt === item.updatedAt)
+    );
+  }
+
+  async function loadBackupHistory() {
+    try {
+      if (Platform.OS === 'web') {
+        if (!canUseWebStorage()) return [];
+        const raw = window.localStorage.getItem(BACKUP_HISTORY_KEY);
+        if (!raw) return [];
+        return normalizeBackupHistory(JSON.parse(raw));
+      }
+      const raw = await AsyncStorage.getItem(BACKUP_HISTORY_KEY);
+      if (!raw) return [];
+      return normalizeBackupHistory(JSON.parse(raw));
+    } catch (error) {
+      return [];
+    }
+  }
+
+  async function persistBackupHistory(next) {
+    const normalized = normalizeBackupHistory(next);
+    try {
+      if (Platform.OS === 'web') {
+        if (!canUseWebStorage()) return;
+        window.localStorage.setItem(BACKUP_HISTORY_KEY, JSON.stringify(normalized));
+        return;
+      }
+      await AsyncStorage.setItem(BACKUP_HISTORY_KEY, JSON.stringify(normalized));
+    } catch (error) {
+      // Ignore storage errors.
+    }
+  }
+
+  async function appendBackupHistory(entry) {
+    if (!entry?.updatedAt) return;
+    const next = [entry, ...backupHistory].filter(
+      (item, index, list) =>
+        index === list.findIndex((existing) => existing.updatedAt === item.updatedAt)
+    );
+    setBackupHistory(next.slice(0, 5));
+    await persistBackupHistory(next);
+  }
+
+  async function refreshBackupHistory() {
+    const local = await loadBackupHistory();
+    if (authStatus !== 'signed_in') {
+      setBackupHistory(local);
+      return;
+    }
+    try {
+      const remote = await listBackupHistory({ limit: 5 });
+      const normalizedRemote = (remote || []).map((entry) => ({
+        updatedAt: entry.updated_at,
+        deviceId: entry.device_id || entry.payload_meta?.deviceId || null,
+        appVersion: entry.app_version || entry.payload_meta?.appVersion || null,
+      }));
+      const merged = mergeBackupHistory(normalizedRemote, local);
+      setBackupHistory(merged);
+      await persistBackupHistory(merged);
+    } catch (error) {
+      setBackupHistory(local);
+    }
+  }
+
+  function parseTimestamp(value) {
+    if (!value) return null;
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return null;
+    return date;
+  }
+
+  function getLocalLatestActivity() {
+    const candidates = [
+      parseTimestamp(identity?.lastActiveAt),
+      parseTimestamp(evidence?.lastEffortAt),
+      parseTimestamp(evidence?.lastChestAt),
+    ].filter(Boolean);
+    if (candidates.length === 0) return null;
+    return new Date(Math.max(...candidates.map((date) => date.getTime())));
   }
 
   async function handleLogEffort(customHabitId, customHabitName) {
@@ -500,11 +716,27 @@ export default function StatusScreen() {
     if (authStatus === 'signed_in') {
       try {
         const payload = await exportAllData();
+        const payloadBytes = JSON.stringify(payload).length;
+        const summary = buildBackupSummary(payload, payloadBytes);
         const encryptedPayload = await encryptIfNeeded(payload);
-        const record = await saveBackupPayload(encryptedPayload);
+        const record = await saveBackupPayload(encryptedPayload, summary);
         setLastBackupAt(record.updated_at);
+        await appendBackupHistory({
+          updatedAt: record.updated_at,
+          deviceId: payload.meta?.deviceId || null,
+          appVersion: payload.meta?.appVersion || null,
+        });
       } catch (error) {
         setAccountMessage(error?.message || 'Auto-backup failed.');
+        try {
+          await logSystemEvent({
+            type: 'backup_error',
+            message: error?.message || 'Auto-backup failed.',
+            context: { source: 'auto' },
+          });
+        } catch (logError) {
+          // Ignore logging errors.
+        }
       }
     }
   }
@@ -529,6 +761,9 @@ export default function StatusScreen() {
   async function handleAccountSignIn() {
     if (!authEnabled || !EMAIL_AUTH_ENABLED) {
       setAccountMessage('Account linking is not enabled.');
+      return;
+    }
+    if (!ensureTurnstileReady()) {
       return;
     }
     setTurnstileMessage('');
@@ -590,6 +825,9 @@ export default function StatusScreen() {
       setAdminBackups([]);
       setAdminSelectedUserId('');
       setAdminSummary(null);
+      setBackupPreview(null);
+      setBackupPreviewPayload(null);
+      setBackupConflict(null);
     } catch (error) {
       setAccountMessage(error?.message || 'Sign out failed.');
     } finally {
@@ -608,9 +846,16 @@ export default function StatusScreen() {
     setAdminMessage('');
     try {
       const payload = await exportAllData();
+      const payloadBytes = JSON.stringify(payload).length;
+      const summary = buildBackupSummary(payload, payloadBytes);
       const encryptedPayload = await encryptIfNeeded(payload);
-      const record = await saveBackupPayload(encryptedPayload);
+      const record = await saveBackupPayload(encryptedPayload, summary);
       setLastBackupAt(record.updated_at);
+      await appendBackupHistory({
+        updatedAt: record.updated_at,
+        deviceId: payload.meta?.deviceId || null,
+        appVersion: payload.meta?.appVersion || null,
+      });
       const message = `Backup saved (${new Date(record.updated_at).toLocaleString()}).${
         isEncryptedPayload(encryptedPayload) ? ' Encrypted.' : ''
       }`;
@@ -620,10 +865,28 @@ export default function StatusScreen() {
         { label: 'Saved backup (self)', at: new Date().toISOString() },
         ...prev,
       ].slice(0, 10));
+      try {
+        await logSystemEvent({
+          type: 'backup_saved',
+          message,
+          context: { source: 'manual' },
+        });
+      } catch (logError) {
+        // Ignore logging errors.
+      }
     } catch (error) {
       const message = error?.message || 'Backup failed.';
       setAccountMessage(message);
       setAdminMessage(message);
+      try {
+        await logSystemEvent({
+          type: 'backup_error',
+          message,
+          context: { source: 'manual' },
+        });
+      } catch (logError) {
+        // Ignore logging errors.
+      }
     } finally {
       setAdminBusy(false);
     }
@@ -641,27 +904,100 @@ export default function StatusScreen() {
     try {
       const record = await fetchBackupPayload();
       const decrypted = await decryptIfNeeded(record.payload);
-      await clearAllData();
-      await importAllData(decrypted);
-      await touchLastActive();
-      setLastBackupAt(record.updated_at);
-      await refresh();
-      const message = `Backup loaded (${new Date(record.updated_at).toLocaleString()}).${
-        isEncryptedPayload(record.payload) ? ' Decrypted.' : ''
-      }`;
-      setAccountMessage(message);
-      setAdminMessage(message);
-      setAdminLog((prev) => [
-        { label: 'Loaded backup (self)', at: new Date().toISOString() },
-        ...prev,
-      ].slice(0, 10));
+      setBackupPreview(summarizeBackupPayload(decrypted, record.updated_at));
+      setBackupPreviewPayload(decrypted);
+      const localLatest = getLocalLatestActivity();
+      const remoteUpdatedAt = parseTimestamp(record.updated_at);
+      if (localLatest && remoteUpdatedAt && localLatest > remoteUpdatedAt) {
+        setBackupConflict({
+          localUpdatedAt: localLatest.toISOString(),
+          remoteUpdatedAt: record.updated_at,
+        });
+        setAccountMessage('Backup found. Local changes are newer — review before restoring.');
+      } else {
+        setBackupConflict(null);
+        setAccountMessage('Backup ready to restore. Review the preview below.');
+      }
     } catch (error) {
       const message = error?.message || 'Load failed.';
       setAccountMessage(message);
       setAdminMessage(message);
+      try {
+        await logSystemEvent({
+          type: 'restore_error',
+          message,
+          context: { source: 'preview' },
+        });
+      } catch (logError) {
+        // Ignore logging errors.
+      }
     } finally {
       setAdminBusy(false);
     }
+  }
+
+  async function handleConfirmLoadBackup() {
+    if (!backupPreviewPayload) return;
+    setAdminBusy(true);
+    setAccountMessage('');
+    setAdminMessage('');
+    try {
+      await clearAllData();
+      await importAllData(backupPreviewPayload);
+      await touchLastActive();
+      const updatedAt = backupPreview?.updatedAt || null;
+      if (updatedAt) {
+        setLastBackupAt(updatedAt);
+      }
+      await refresh();
+      const message = updatedAt
+        ? `Backup restored (${new Date(updatedAt).toLocaleString()}).`
+        : 'Backup restored.';
+      setAccountMessage(message);
+      setAdminMessage(message);
+      setAdminLog((prev) => [
+        { label: 'Restored backup (self)', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+      try {
+        await logSystemEvent({
+          type: 'restore_success',
+          message,
+          context: { source: 'confirm' },
+        });
+      } catch (logError) {
+        // Ignore logging errors.
+      }
+    } catch (error) {
+      const message = error?.message || 'Restore failed.';
+      setAccountMessage(message);
+      setAdminMessage(message);
+      try {
+        await logSystemEvent({
+          type: 'restore_error',
+          message,
+          context: { source: 'confirm' },
+        });
+      } catch (logError) {
+        // Ignore logging errors.
+      }
+    } finally {
+      setAdminBusy(false);
+      setBackupPreview(null);
+      setBackupPreviewPayload(null);
+      setBackupConflict(null);
+    }
+  }
+
+  function handleCancelBackupPreview() {
+    setBackupPreview(null);
+    setBackupPreviewPayload(null);
+    setBackupConflict(null);
+  }
+
+  async function handleClearBackupHistory() {
+    setBackupHistory([]);
+    await persistBackupHistory([]);
   }
 
   async function handleRefreshBackups() {
@@ -732,8 +1068,266 @@ export default function StatusScreen() {
         { label: 'Previewed backup', at: new Date().toISOString() },
         ...prev,
       ].slice(0, 10));
+      try {
+        await logAdminAction({
+          action: 'preview_backup',
+          targetUserId: adminSelectedUserId,
+          context: { updatedAt: data.updated_at },
+        });
+      } catch (logError) {
+        // Ignore logging errors.
+      }
     } catch (error) {
       setAdminMessage(error?.message || 'Preview failed.');
+    } finally {
+      setAdminLoading(false);
+    }
+  }
+
+  async function handleLoadBackupHistoryForUser() {
+    if (adminStatus !== 'signed_in') {
+      setAdminMessage('Admin access only.');
+      return;
+    }
+    if (!adminSelectedUserId) return;
+    setAdminLoading(true);
+    setAdminMessage('');
+    try {
+      const history = await listBackupHistory({
+        limit: 10,
+        userId: adminSelectedUserId,
+        includePayload: true,
+      });
+      const normalized = (history || []).map((entry) => ({
+        id: entry.id,
+        updatedAt: entry.updated_at,
+        deviceId: entry.device_id || entry.payload_meta?.deviceId || null,
+        appVersion: entry.app_version || entry.payload_meta?.appVersion || null,
+        payload: entry.payload || null,
+        payloadMeta: entry.payload_meta || null,
+      }));
+      setAdminHistory(normalized);
+      if (normalized.length === 0) {
+        setAdminMessage('No backup history found for this user.');
+      }
+      setAdminLog((prev) => [
+        { label: 'Loaded backup history', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+    } catch (error) {
+      setAdminMessage(error?.message || 'Failed to load backup history.');
+    } finally {
+      setAdminLoading(false);
+    }
+  }
+
+  async function handleRestoreHistoryEntry(entry) {
+    if (!entry?.payload) {
+      setAdminMessage('No payload found for this history entry.');
+      return;
+    }
+    const confirmRestore =
+      Platform.OS !== 'web' ||
+      (typeof window !== 'undefined' &&
+        window.confirm('Restore this historical backup to this device? This will replace local data.'));
+    if (!confirmRestore) return;
+    setAdminLoading(true);
+    setAdminMessage('');
+    try {
+      const decrypted = await decryptIfNeeded(entry.payload);
+      await clearAllData();
+      await importAllData(decrypted);
+      await touchLastActive();
+      await refresh();
+      setAdminMessage(`Restored history entry (${new Date(entry.updatedAt).toLocaleString()}).`);
+      setAdminLog((prev) => [
+        { label: 'Restored history entry', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+      try {
+        await logAdminAction({
+          action: 'restore_history_entry',
+          targetUserId: adminSelectedUserId,
+          context: { updatedAt: entry.updatedAt },
+        });
+      } catch (logError) {
+        // Ignore logging errors.
+      }
+    } catch (error) {
+      setAdminMessage(error?.message || 'History restore failed.');
+    } finally {
+      setAdminLoading(false);
+    }
+  }
+
+  async function handleExportHistoryEntry(entry) {
+    if (!entry?.payload) {
+      setAdminMessage('No payload found for this history entry.');
+      return;
+    }
+    if (Platform.OS !== 'web') {
+      setAdminMessage('Export is available on web only.');
+      return;
+    }
+    try {
+      const fileName = `lifemaxing_backup_${adminSelectedUserId}_${new Date(
+        entry.updatedAt
+      ).toISOString()}.json`;
+      const blob = new Blob([JSON.stringify(entry.payload, null, 2)], {
+        type: 'application/json',
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = fileName;
+      link.click();
+      URL.revokeObjectURL(url);
+      setAdminMessage('Backup history exported.');
+      try {
+        await logAdminAction({
+          action: 'export_history_entry',
+          targetUserId: adminSelectedUserId,
+          context: { updatedAt: entry.updatedAt },
+        });
+      } catch (logError) {
+        // Ignore logging errors.
+      }
+    } catch (error) {
+      setAdminMessage(error?.message || 'History export failed.');
+    }
+  }
+
+  async function handleRefreshAdminOverview() {
+    if (adminStatus !== 'signed_in') return;
+    setAdminLoading(true);
+    setAdminMessage('');
+    try {
+      const [users, summaries, events, audits] = await Promise.all([
+        listUserProfiles({
+          limit: adminUserLimit,
+          offset: adminUserPage * adminUserLimit,
+          search: adminUserSearch.trim(),
+          userId: adminUserIdSearch.trim(),
+        }),
+        listBackupSummaries({
+          limit: adminSummaryLimit,
+          offset: adminUserPage * adminSummaryLimit,
+          userId: adminUserIdSearch.trim(),
+          from: adminDateFrom.trim(),
+          to: adminDateTo.trim(),
+        }),
+        listSystemEvents({
+          limit: adminEventsLimit,
+          offset: adminEventsPage * adminEventsLimit,
+          userId: adminUserIdSearch.trim(),
+          from: adminDateFrom.trim(),
+          to: adminDateTo.trim(),
+        }),
+        listAdminAudit({
+          limit: adminAuditLimit,
+          offset: adminAuditPage * adminAuditLimit,
+          targetUserId: adminUserIdSearch.trim(),
+          from: adminDateFrom.trim(),
+          to: adminDateTo.trim(),
+        }),
+      ]);
+      setAdminUsers(users);
+      setAdminSummaries(summaries);
+      setAdminEvents(events);
+      setAdminAudit(audits);
+    } catch (error) {
+      setAdminMessage(error?.message || 'Failed to load admin overview.');
+    } finally {
+      setAdminLoading(false);
+    }
+  }
+
+  function confirmAdminAction(message) {
+    if (Platform.OS !== 'web') return true;
+    if (typeof window === 'undefined') return true;
+    return window.confirm(message);
+  }
+
+  async function handleDeleteUserData(type) {
+    if (adminStatus !== 'signed_in') {
+      setAdminMessage('Admin access only.');
+      return;
+    }
+    if (!adminSelectedUserId) return;
+    const labels = {
+      backup: 'latest backup',
+      history: 'backup history',
+      summary: 'summary stats',
+      profile: 'profile',
+      events: 'system events',
+    };
+    const confirm = confirmAdminAction(
+      `Delete ${labels[type] || type} for user ${adminSelectedUserId}? This cannot be undone.`
+    );
+    if (!confirm) return;
+    setAdminLoading(true);
+    setAdminMessage('');
+    try {
+      if (type === 'backup') await deleteUserBackup({ userId: adminSelectedUserId });
+      if (type === 'history') await deleteUserBackupHistory({ userId: adminSelectedUserId });
+      if (type === 'summary') await deleteUserSummary({ userId: adminSelectedUserId });
+      if (type === 'profile') await deleteUserProfile({ userId: adminSelectedUserId });
+      if (type === 'events') await deleteUserSystemEvents({ userId: adminSelectedUserId });
+      setAdminMessage(`Deleted ${labels[type] || type}.`);
+      setAdminLog((prev) => [
+        { label: `Deleted ${labels[type] || type}`, at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+      try {
+        await logAdminAction({
+          action: `delete_${type}`,
+          targetUserId: adminSelectedUserId,
+        });
+      } catch (logError) {
+        // Ignore logging errors.
+      }
+      await handleRefreshAdminOverview();
+    } catch (error) {
+      setAdminMessage(error?.message || 'Delete failed.');
+    } finally {
+      setAdminLoading(false);
+    }
+  }
+
+  async function handleDeleteAllUserData() {
+    if (adminStatus !== 'signed_in') {
+      setAdminMessage('Admin access only.');
+      return;
+    }
+    if (!adminSelectedUserId) return;
+    const confirm = confirmAdminAction(
+      `Delete ALL data for user ${adminSelectedUserId}? This cannot be undone.`
+    );
+    if (!confirm) return;
+    setAdminLoading(true);
+    setAdminMessage('');
+    try {
+      await deleteUserBackup({ userId: adminSelectedUserId });
+      await deleteUserBackupHistory({ userId: adminSelectedUserId });
+      await deleteUserSummary({ userId: adminSelectedUserId });
+      await deleteUserSystemEvents({ userId: adminSelectedUserId });
+      await deleteUserProfile({ userId: adminSelectedUserId });
+      setAdminMessage('Deleted all user data.');
+      setAdminLog((prev) => [
+        { label: 'Deleted all user data', at: new Date().toISOString() },
+        ...prev,
+      ].slice(0, 10));
+      try {
+        await logAdminAction({
+          action: 'delete_all_user_data',
+          targetUserId: adminSelectedUserId,
+        });
+      } catch (logError) {
+        // Ignore logging errors.
+      }
+      await handleRefreshAdminOverview();
+    } catch (error) {
+      setAdminMessage(error?.message || 'Delete failed.');
     } finally {
       setAdminLoading(false);
     }
@@ -763,6 +1357,15 @@ export default function StatusScreen() {
         { label: 'Loaded backup to device', at: new Date().toISOString() },
         ...prev,
       ].slice(0, 10));
+      try {
+        await logAdminAction({
+          action: 'load_backup_to_device',
+          targetUserId: adminSelectedUserId,
+          context: { updatedAt: record.updated_at },
+        });
+      } catch (logError) {
+        // Ignore logging errors.
+      }
     } catch (error) {
       setAdminMessage(error?.message || 'Load failed.');
     } finally {
@@ -798,6 +1401,15 @@ export default function StatusScreen() {
         { label: 'Exported backup JSON', at: new Date().toISOString() },
         ...prev,
       ].slice(0, 10));
+      try {
+        await logAdminAction({
+          action: 'export_backup',
+          targetUserId: adminSelectedUserId,
+          context: { updatedAt: data.updated_at },
+        });
+      } catch (logError) {
+        // Ignore logging errors.
+      }
     } catch (error) {
       setAdminMessage(error?.message || 'Export failed.');
     } finally {
@@ -831,15 +1443,11 @@ export default function StatusScreen() {
     const created = await createHabit(decorated);
     setNewHabitName('');
     setHabitId(created.id);
-    await handleLogEffort(created.id, created.name);
     await refresh();
   }
 
   async function handleToggleHabit(habit) {
     await setHabitActive(habit.id, !habit.isActive);
-    if (!habit.isActive) {
-      await handleLogEffort(habit.id, habit.name);
-    }
     if (habit.id === habitId && habit.isActive) {
       const nextActive = habits.find((item) => item.isActive && item.id !== habit.id);
       setHabitId(nextActive ? nextActive.id : null);
@@ -884,6 +1492,9 @@ export default function StatusScreen() {
   async function handleAccountSignUp() {
     if (!authEnabled || !EMAIL_AUTH_ENABLED) {
       setAccountMessage('Account linking is not enabled.');
+      return;
+    }
+    if (!ensureTurnstileReady()) {
       return;
     }
     setTurnstileMessage('');
@@ -1156,10 +1767,7 @@ export default function StatusScreen() {
             <Text style={styles.statValue}>{counts.chests}</Text>
           </View>
           <Text style={styles.subtle}>
-            Days since last effort: {inactivityDays}
-          </Text>
-          <Text style={styles.subtle}>
-            Re-entry mode: {isQuietMode ? 'quiet' : 'standard'} (quiet after {QUIET_MODE_DAYS}+ days)
+            Re-entry mode: {isQuietMode ? 'quiet' : 'standard'}
           </Text>
           <Text style={styles.subtle}>
             Active habits: {activeHabits} - Paused: {pausedHabits}
@@ -1219,7 +1827,7 @@ export default function StatusScreen() {
         <View style={styles.panelQuiet}>
           <Text style={styles.panelTitle}>Re-entry</Text>
           <Text style={styles.quietText}>
-            No backlog. Creating a habit auto-logs effort.
+            No backlog. Start small and log a single effort when ready.
           </Text>
         </View>
       ) : null}
@@ -1227,83 +1835,64 @@ export default function StatusScreen() {
       {showHelp ? (
         <View style={styles.panel}>
           <Text style={styles.panelTitle}>Account</Text>
-          <Text style={styles.subtle}>
-            {authStatus === 'signed_in'
-              ? `Mode: Linked (${authEmail || 'signed in'})`
-              : 'Mode: Guest (local-first)'}
-          </Text>
-          {adminStatus === 'signed_in' ? (
-            <Text style={styles.subtle}>Admin access enabled.</Text>
-          ) : null}
-          {authStatus === 'signed_in' ? (
-            <Text style={styles.subtle}>
-              Admin claim: {adminClaim === null ? 'Not present' : adminClaim ? 'true' : 'false'}
-            </Text>
-          ) : null}
-          {authStatus === 'disabled' ? (
-            <Text style={styles.subtle}>Account linking is not configured.</Text>
-          ) : null}
-          <Pressable
-            style={styles.buttonGhost}
-            onPress={() => setShowLoginForm((current) => !current)}
-            disabled={!authEnabled}
-          >
-            <Text style={styles.buttonGhostText}>Link account</Text>
-          </Pressable>
-          {showLoginForm ? (
-            <View style={styles.loginPanel}>
-              <TextInput
-                value={loginEmail}
-                onChangeText={setLoginEmail}
-                placeholder="Email"
-                placeholderTextColor="#4b5563"
-                style={styles.input}
-                autoCapitalize="none"
-                keyboardType="email-address"
-              />
-              <TextInput
-                value={loginPassword}
-                onChangeText={setLoginPassword}
-                placeholder="Password"
-                placeholderTextColor="#4b5563"
-                style={styles.input}
-                secureTextEntry
-              />
-              {turnstileEnabled ? (
-                <>
-                  <TurnstileWidget
-                    onToken={handleTurnstileToken}
-                    onError={handleTurnstileError}
-                  />
-                  {turnstileStatus ? (
-                    <Text style={styles.subtle}>{turnstileStatus}</Text>
-                  ) : null}
-                </>
-              ) : null}
+          <View style={styles.helpTabRow}>
+            {HELP_TABS.map((tab) => (
               <Pressable
-                style={styles.button}
-                onPress={handleAccountSignIn}
-                disabled={adminBusy}
+                key={tab}
+                style={[styles.helpTab, helpTab === tab && styles.helpTabActive]}
+                onPress={() => setHelpTab(tab)}
               >
-                <Text style={styles.buttonText}>Sign in</Text>
+                <Text style={[styles.helpTabText, helpTab === tab && styles.helpTabTextActive]}>
+                  {tab}
+                </Text>
               </Pressable>
+            ))}
+          </View>
+
+          {helpTab === 'Account' ? (
+            <View style={styles.helpCard}>
+              <Text style={styles.menuLabel}>Session</Text>
+              <Text style={styles.subtle}>
+                {authStatus === 'signed_in'
+                  ? `Mode: Linked (${authEmail || 'signed in'})`
+                  : 'Mode: Guest (local-first)'}
+              </Text>
+              {adminStatus === 'signed_in' ? (
+                <Text style={styles.subtle}>Admin access enabled.</Text>
+              ) : null}
+              {authStatus === 'signed_in' ? (
+                <Text style={styles.subtle}>
+                  Admin claim: {adminClaim === null ? 'Not present' : adminClaim ? 'true' : 'false'}
+                </Text>
+              ) : null}
             </View>
           ) : null}
-          {authStatus === 'signed_in' ? (
-            <Pressable
-              style={styles.buttonGhost}
-              onPress={handleAccountSignOut}
-              disabled={adminBusy}
-            >
-              <Text style={styles.buttonGhostText}>Sign out</Text>
-            </Pressable>
-          ) : null}
-          {authStatus === 'signed_in' ? (
-            <View style={styles.menuSection}>
-              <Text style={styles.menuLabel}>Backup</Text>
+
+          {helpTab === 'Backups' ? (
+            <View style={styles.helpCard}>
+              <Text style={styles.menuLabel}>Backups</Text>
               <Text style={styles.subtle}>
                 Last backup: {lastBackupAt ? new Date(lastBackupAt).toLocaleString() : 'None'}
               </Text>
+              {backupHistory.length > 0 ? (
+                <View style={styles.menuSection}>
+                  <Text style={styles.menuLabel}>Backup History</Text>
+                  {backupHistory.map((entry) => (
+                    <Text key={entry.updatedAt} style={styles.subtle}>
+                      {new Date(entry.updatedAt).toLocaleString()}
+                      {entry.deviceId ? ` - ${entry.deviceId}` : ''}
+                      {entry.appVersion ? ` (v${entry.appVersion})` : ''}
+                    </Text>
+                  ))}
+                  <Pressable
+                    style={styles.buttonGhost}
+                    onPress={handleClearBackupHistory}
+                    disabled={adminBusy}
+                  >
+                    <Text style={styles.buttonGhostText}>Clear history</Text>
+                  </Pressable>
+                </View>
+              ) : null}
               <Pressable
                 style={styles.buttonGhost}
                 onPress={handleSaveBackup}
@@ -1338,6 +1927,674 @@ export default function StatusScreen() {
               ) : (
                 <Text style={styles.subtle}>Backup encryption is available on web only.</Text>
               )}
+              {backupPreview ? (
+                <View style={styles.menuSection}>
+                  <Text style={styles.menuLabel}>Restore Preview</Text>
+                  {backupConflict ? (
+                    <Text style={styles.subtle}>
+                      Local activity is newer than this backup. Restoring will replace those changes.
+                    </Text>
+                  ) : null}
+                  <Text style={styles.subtle}>Level {backupPreview.identityLevel}</Text>
+                  <Text style={styles.subtle}>Effort {backupPreview.totalEffort}</Text>
+                  <Text style={styles.subtle}>Habits {backupPreview.habits}</Text>
+                  <Text style={styles.subtle}>Chests {backupPreview.chests}</Text>
+                  <Text style={styles.subtle}>Items {backupPreview.items}</Text>
+                  <Pressable
+                    style={styles.button}
+                    onPress={handleConfirmLoadBackup}
+                    disabled={adminBusy}
+                  >
+                    <Text style={styles.buttonText}>
+                      {backupConflict ? 'Restore anyway' : 'Restore now'}
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.buttonGhost}
+                    onPress={handleCancelBackupPreview}
+                    disabled={adminBusy}
+                  >
+                    <Text style={styles.buttonGhostText}>Cancel</Text>
+                  </Pressable>
+                </View>
+              ) : null}
+            </View>
+          ) : null}
+
+          {helpTab === 'Local' ? (
+            <View style={styles.helpCard}>
+              <Text style={styles.menuLabel}>Local Data</Text>
+              <Pressable style={styles.buttonGhost} onPress={handleExportLocalData}>
+                <Text style={styles.buttonGhostText}>Export local data</Text>
+              </Pressable>
+              <Pressable style={styles.buttonGhost} onPress={handleImportLocalData}>
+                <Text style={styles.buttonGhostText}>Import local data</Text>
+              </Pressable>
+              <Pressable style={styles.buttonGhost} onPress={handleResetLocalData}>
+                <Text style={styles.buttonGhostText}>Reset local data</Text>
+              </Pressable>
+            </View>
+          ) : null}
+
+          {helpTab === 'Onboarding' ? (
+            <View style={styles.helpCard}>
+              <Text style={styles.menuLabel}>Account & Onboarding</Text>
+              <Pressable style={styles.buttonGhost} onPress={handleShowOnboarding}>
+                <Text style={styles.buttonGhostText}>Show onboarding</Text>
+              </Pressable>
+            </View>
+          ) : null}
+
+          {helpTab === 'Trust' && SHOW_TRUST_TESTS ? (
+            <View style={styles.helpCard}>
+              <Text style={styles.menuLabel}>Trust Tests</Text>
+              <Text style={styles.subtle}>Manual checklist (dev sanity):</Text>
+              <View style={styles.trustList}>
+                <Text style={styles.trustItem}>* Reopen after inactivity feels safe</Text>
+                <Text style={styles.trustItem}>* Losing combat has zero downside</Text>
+                <Text style={styles.trustItem}>* Consistency beats spikes</Text>
+                <Text style={styles.trustItem}>* Power never appears without effort</Text>
+                <Text style={styles.trustItem}>* Identity never decreases</Text>
+              </View>
+            </View>
+          ) : null}
+
+          {accountMessage ? <Text style={styles.subtle}>{accountMessage}</Text> : null}
+        </View>
+      ) : null}
+{showAdmin ? (
+        <View style={styles.panel}>
+          <Text style={styles.panelTitle}>Admin Dashboard</Text>
+          <Text style={styles.subtle}>
+            Server must enforce RLS. Client checks alone are not sufficient.
+          </Text>
+          <Text style={styles.subtle}>
+            Admin email list only gates UI visibility, not data access.
+          </Text>
+          {adminStatus === 'disabled' ? (
+            <Text style={styles.subtle}>Admin tools are disabled.</Text>
+          ) : null}
+          {adminStatus === 'signed_out' ? (
+            <Text style={styles.subtle}>Sign in via Help > Link account to access admin tools.</Text>
+          ) : null}
+          {adminStatus === 'signed_in' ? (
+            <>
+              <View style={styles.adminTabRow}>
+                {ADMIN_TABS.map((tab) => (
+                  <Pressable
+                    key={tab}
+                    style={[styles.adminTab, adminTab === tab && styles.adminTabActive]}
+                    onPress={() => setAdminTab(tab)}
+                  >
+                    <Text style={[styles.adminTabText, adminTab === tab && styles.adminTabTextActive]}>
+                      {tab}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+
+              {adminTab === 'Overview' ? (
+                <View style={styles.adminGrid}>
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>Users</Text>
+                    <View style={styles.habitInputRow}>
+                      <TextInput
+                        value={adminUserSearch}
+                        onChangeText={setAdminUserSearch}
+                        placeholder="Search email"
+                        placeholderTextColor="#4b5563"
+                        style={styles.input}
+                        autoCapitalize="none"
+                      />
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={handleRefreshAdminOverview}
+                        disabled={adminLoading}
+                      >
+                        <Text style={styles.buttonText}>Load</Text>
+                      </Pressable>
+                    </View>
+                    <View style={styles.habitInputRow}>
+                      <TextInput
+                        value={adminUserIdSearch}
+                        onChangeText={setAdminUserIdSearch}
+                        placeholder="User id"
+                        placeholderTextColor="#4b5563"
+                        style={styles.input}
+                        autoCapitalize="none"
+                      />
+                    </View>
+                    <View style={styles.habitInputRow}>
+                      <TextInput
+                        value={adminDateFrom}
+                        onChangeText={setAdminDateFrom}
+                        placeholder="From (YYYY-MM-DD)"
+                        placeholderTextColor="#4b5563"
+                        style={styles.input}
+                        autoCapitalize="none"
+                      />
+                      <TextInput
+                        value={adminDateTo}
+                        onChangeText={setAdminDateTo}
+                        placeholder="To (YYYY-MM-DD)"
+                        placeholderTextColor="#4b5563"
+                        style={styles.input}
+                        autoCapitalize="none"
+                      />
+                    </View>
+                    {adminUsers.length === 0 ? (
+                      <Text style={styles.subtle}>No users loaded.</Text>
+                    ) : (
+                      adminUsers.map((user) => {
+                        const summary = adminSummaries.find(
+                          (item) => item.user_id === user.user_id
+                        );
+                        return (
+                          <View key={user.user_id} style={styles.adminRow}>
+                            <Text style={styles.adminRowTitle}>{user.email || user.user_id}</Text>
+                            <Text style={styles.subtle}>
+                              Last seen: {user.last_seen_at ? new Date(user.last_seen_at).toLocaleString() : '-'}
+                            </Text>
+                            {summary ? (
+                              <Text style={styles.subtle}>
+                                Effort {summary.total_effort || 0} - Habits {summary.habits || 0} -
+                                Chests {summary.chests || 0}
+                              </Text>
+                            ) : (
+                              <Text style={styles.subtle}>No summary yet.</Text>
+                            )}
+                          </View>
+                        );
+                      })
+                    )}
+                    <View style={styles.habitInputRow}>
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={() => {
+                          setAdminUserPage((prev) => Math.max(0, prev - 1));
+                          handleRefreshAdminOverview();
+                        }}
+                        disabled={adminLoading || adminUserPage === 0}
+                      >
+                        <Text style={styles.buttonText}>Prev</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={() => {
+                          setAdminUserPage((prev) => prev + 1);
+                          handleRefreshAdminOverview();
+                        }}
+                        disabled={adminLoading}
+                      >
+                        <Text style={styles.buttonText}>Next</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>System Health</Text>
+                    {adminEvents.length === 0 ? (
+                      <Text style={styles.subtle}>No events.</Text>
+                    ) : (
+                      adminEvents.map((event) => (
+                        <Text key={event.id} style={styles.subtle}>
+                          {new Date(event.created_at).toLocaleString()} - {event.type}
+                          {event.message ? ` - ${event.message}` : ''}
+                        </Text>
+                      ))
+                    )}
+                    <View style={styles.habitInputRow}>
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={() => {
+                          setAdminEventsPage((prev) => Math.max(0, prev - 1));
+                          handleRefreshAdminOverview();
+                        }}
+                        disabled={adminLoading || adminEventsPage === 0}
+                      >
+                        <Text style={styles.buttonText}>Prev</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={() => {
+                          setAdminEventsPage((prev) => prev + 1);
+                          handleRefreshAdminOverview();
+                        }}
+                        disabled={adminLoading}
+                      >
+                        <Text style={styles.buttonText}>Next</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>Admin Audit</Text>
+                    {adminAudit.length === 0 ? (
+                      <Text style={styles.subtle}>No admin actions logged.</Text>
+                    ) : (
+                      adminAudit.map((entry) => (
+                        <Text key={entry.id} style={styles.subtle}>
+                          {new Date(entry.created_at).toLocaleString()} - {entry.action}
+                          {entry.target_user_id ? ` - ${entry.target_user_id}` : ''}
+                        </Text>
+                      ))
+                    )}
+                    <View style={styles.habitInputRow}>
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={() => {
+                          setAdminAuditPage((prev) => Math.max(0, prev - 1));
+                          handleRefreshAdminOverview();
+                        }}
+                        disabled={adminLoading || adminAuditPage === 0}
+                      >
+                        <Text style={styles.buttonText}>Prev</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={() => {
+                          setAdminAuditPage((prev) => prev + 1);
+                          handleRefreshAdminOverview();
+                        }}
+                        disabled={adminLoading}
+                      >
+                        <Text style={styles.buttonText}>Next</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                </View>
+              ) : null}
+
+              {adminTab === 'Backups' ? (
+                <View style={styles.adminGrid}>
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>Backups</Text>
+                    <Pressable
+                      style={styles.buttonGhost}
+                      onPress={handleVerifyRls}
+                      disabled={adminLoading}
+                    >
+                      <Text style={styles.buttonGhostText}>Verify RLS</Text>
+                    </Pressable>
+                    {rlsMessage ? <Text style={styles.subtle}>{rlsMessage}</Text> : null}
+                    <View style={styles.habitInputRow}>
+                      <TextInput
+                        value={adminFilter}
+                        onChangeText={setAdminFilter}
+                        placeholder="Filter by user id"
+                        placeholderTextColor="#4b5563"
+                        style={styles.input}
+                        autoCapitalize="none"
+                      />
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={handleRefreshBackups}
+                        disabled={adminLoading}
+                      >
+                        <Text style={styles.buttonText}>Refresh</Text>
+                      </Pressable>
+                    </View>
+                    {adminBackups.length === 0 ? (
+                      <Text style={styles.subtle}>No backups loaded yet.</Text>
+                    ) : (
+                      adminBackups.map((backup) => (
+                        <Pressable
+                          key={backup.user_id}
+                          style={[
+                            styles.adminRow,
+                            adminSelectedUserId === backup.user_id && styles.adminRowSelected,
+                          ]}
+                          onPress={() => {
+                            setAdminSelectedUserId(backup.user_id);
+                            setAdminSummary(null);
+                            setAdminHistory([]);
+                          }}
+                        >
+                          <View>
+                            <Text style={styles.adminRowTitle}>{backup.user_id}</Text>
+                            <Text style={styles.subtle}>
+                              Updated {new Date(backup.updated_at).toLocaleString()}
+                            </Text>
+                          </View>
+                        </Pressable>
+                      ))
+                    )}
+                  </View>
+
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>Selected User</Text>
+                    {adminSelectedUserId ? (
+                      <>
+                        <Text style={styles.subtle}>{adminSelectedUserId}</Text>
+                        <Pressable
+                          style={styles.button}
+                          onPress={handlePreviewBackup}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonText}>Preview summary</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={handleLoadBackupHistoryForUser}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Load history</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={() => handleDeleteUserData('backup')}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Delete latest backup</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={() => handleDeleteUserData('history')}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Delete backup history</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={() => handleDeleteUserData('summary')}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Delete summary</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={() => handleDeleteUserData('events')}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Delete system events</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={() => handleDeleteUserData('profile')}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Delete profile</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={handleDeleteAllUserData}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Delete ALL user data</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={handleExportBackup}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Export JSON</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={handleLoadBackupForUser}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Load to this device</Text>
+                        </Pressable>
+                      </>
+                    ) : (
+                      <Text style={styles.subtle}>Select a user to manage.</Text>
+                    )}
+                  </View>
+
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>History</Text>
+                    {adminHistory.length > 0 ? (
+                      adminHistory.map((entry) => (
+                        <View key={entry.id || entry.updatedAt} style={styles.menuSection}>
+                          <Text style={styles.subtle}>
+                            {new Date(entry.updatedAt).toLocaleString()}
+                            {entry.deviceId ? ` - ${entry.deviceId}` : ''}
+                            {entry.appVersion ? ` (v${entry.appVersion})` : ''}
+                          </Text>
+                          <View style={styles.habitInputRow}>
+                            <Pressable
+                              style={styles.buttonSmall}
+                              onPress={() => handleRestoreHistoryEntry(entry)}
+                              disabled={adminLoading}
+                            >
+                              <Text style={styles.buttonText}>Restore</Text>
+                            </Pressable>
+                            <Pressable
+                              style={styles.buttonSmall}
+                              onPress={() => handleExportHistoryEntry(entry)}
+                              disabled={adminLoading}
+                            >
+                              <Text style={styles.buttonText}>Export</Text>
+                            </Pressable>
+                          </View>
+                        </View>
+                      ))
+                    ) : (
+                      <Text style={styles.subtle}>No history loaded.</Text>
+                    )}
+                  </View>
+                </View>
+              ) : null}
+
+              {adminTab === 'Logs' ? (
+                <View style={styles.adminGrid}>
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>Recent Actions</Text>
+                    {adminLog.length > 0 ? (
+                      adminLog.map((entry, index) => (
+                        <Text key={`${entry.at}-${index}`} style={styles.subtle}>
+                          {new Date(entry.at).toLocaleString()} - {entry.label}
+                        </Text>
+                      ))
+                    ) : (
+                      <Text style={styles.subtle}>No recent actions.</Text>
+                    )}
+                  </View>
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>Admin Message</Text>
+                    <Text style={styles.subtle}>{adminMessage || 'No messages.'}</Text>
+                  </View>
+                </View>
+              ) : null}
+            </>
+          ) : null}
+          {adminMessage ? <Text style={styles.subtle}>{adminMessage}</Text> : null}
+        </View>
+      ) : null}
+{showTasks ? (
+        <View style={styles.panel}>
+          <Text style={styles.panelTitle}>Status</Text>
+          <View style={styles.heroRow}>
+            <View style={styles.avatarBox}>
+              <Text style={styles.avatarText}>SIGIL</Text>
+            </View>
+            <View style={styles.heroStats}>
+              <Text style={styles.heroLabel}>Identity Level</Text>
+              <Text style={styles.heroValue}>{identity.level}</Text>
+              <Text style={styles.heroSubtle}>Total Effort: {identity.totalEffortUnits}</Text>
+            </View>
+          </View>
+          <View style={styles.divider} />
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Habits</Text>
+            <Text style={styles.statValue}>{counts.habits}</Text>
+          </View>
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Efforts Logged</Text>
+            <Text style={styles.statValue}>{counts.efforts}</Text>
+          </View>
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Chests Earned</Text>
+            <Text style={styles.statValue}>{counts.chests}</Text>
+          </View>
+          <Text style={styles.subtle}>
+            Re-entry mode: {isQuietMode ? 'quiet' : 'standard'}
+          </Text>
+          <Text style={styles.subtle}>
+            Active habits: {activeHabits} - Paused: {pausedHabits}
+          </Text>
+          {!EMAIL_AUTH_ENABLED ? (
+            <Text style={styles.subtle}>
+              Email sign-in disabled until a domain is configured.
+            </Text>
+          ) : null}
+          {mercyStatus?.eligible ? (
+            <Text style={styles.subtle}>Mercy active: slight chest boost on next effort.</Text>
+          ) : null}
+          {mercyStatus && !mercyStatus.eligible && mercyStatus.cooldownDaysRemaining > 0 ? (
+            <Text style={styles.subtle}>
+              Mercy recharges in {mercyStatus.cooldownDaysRemaining} days.
+            </Text>
+          ) : null}
+        </View>
+      ) : null}
+
+      {showTasks ? (
+        <View style={styles.panel}>
+          <Text style={styles.panelTitle}>Core Stats</Text>
+          <Text style={styles.subtle}>
+            Phase 2: character stats + point system rewrite.
+          </Text>
+        </View>
+      ) : null}
+
+      {showTasks && evidence ? (
+        <View style={[styles.panel, styles.panelTight]}>
+          <Text style={styles.panelTitle}>Evidence</Text>
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Days Shown Up</Text>
+            <Text style={styles.statValue}>{evidence.activeDays}</Text>
+          </View>
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Last Effort</Text>
+            <Text style={styles.statValue}>
+              {evidence.lastEffortAt
+                ? new Date(evidence.lastEffortAt).toLocaleDateString()
+                : 'No log yet'}
+            </Text>
+          </View>
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Last Chest</Text>
+            <Text style={styles.statValue}>
+              {evidence.lastChestAt
+                ? new Date(evidence.lastChestAt).toLocaleDateString()
+                : 'No chest yet'}
+            </Text>
+          </View>
+        </View>
+      ) : null}
+
+      {showTasks && isQuietMode ? (
+        <View style={styles.panelQuiet}>
+          <Text style={styles.panelTitle}>Re-entry</Text>
+          <Text style={styles.quietText}>
+            No backlog. Start small and log a single effort when ready.
+          </Text>
+        </View>
+      ) : null}
+
+      {showHelp ? (
+        <View style={styles.panel}>
+          <Text style={styles.panelTitle}>Account</Text>
+          <Text style={styles.subtle}>
+            {authStatus === 'signed_in'
+              ? `Mode: Linked (${authEmail || 'signed in'})`
+              : 'Mode: Guest (local-first)'}
+          </Text>
+          {adminStatus === 'signed_in' ? (
+            <Text style={styles.subtle}>Admin access enabled.</Text>
+          ) : null}
+          {authStatus === 'signed_in' ? (
+            <Text style={styles.subtle}>
+              Admin claim: {adminClaim === null ? 'Not present' : adminClaim ? 'true' : 'false'}
+            </Text>
+          ) : null}
+          <Text style={styles.subtle}>
+            Last backup: {lastBackupAt ? new Date(lastBackupAt).toLocaleString() : 'None'}
+          </Text>
+          {backupHistory.length > 0 ? (
+            <View style={styles.menuSection}>
+              <Text style={styles.menuLabel}>Backup History</Text>
+              {backupHistory.map((entry) => (
+                <Text key={entry.updatedAt} style={styles.subtle}>
+                  {new Date(entry.updatedAt).toLocaleString()}
+                  {entry.deviceId ? ` - ${entry.deviceId}` : ''}
+                  {entry.appVersion ? ` (v${entry.appVersion})` : ''}
+                </Text>
+              ))}
+              <Pressable
+                style={styles.buttonGhost}
+                onPress={handleClearBackupHistory}
+                disabled={adminBusy}
+              >
+                <Text style={styles.buttonGhostText}>Clear history</Text>
+              </Pressable>
+            </View>
+          ) : null}
+          <Pressable
+            style={styles.buttonGhost}
+            onPress={handleSaveBackup}
+            disabled={adminBusy}
+          >
+            <Text style={styles.buttonGhostText}>Save backup</Text>
+          </Pressable>
+          <Pressable
+            style={styles.buttonGhost}
+            onPress={handleLoadBackup}
+            disabled={adminBusy}
+          >
+            <Text style={styles.buttonGhostText}>Load backup to this device</Text>
+          </Pressable>
+          {Platform.OS === 'web' ? (
+            <View style={styles.menuSection}>
+              <Text style={styles.menuLabel}>Backup Encryption</Text>
+              <TextInput
+                value={backupPassphrase}
+                onChangeText={setBackupPassphrase}
+                placeholder="Passphrase (optional)"
+                placeholderTextColor="#4b5563"
+                style={styles.input}
+                secureTextEntry
+              />
+              <Text style={styles.subtle}>
+                {encryptionEnabled
+                  ? 'Encrypting backups on this device.'
+                  : 'Leave blank to save unencrypted backups.'}
+              </Text>
+            </View>
+          ) : (
+            <Text style={styles.subtle}>Backup encryption is available on web only.</Text>
+          )}
+          {backupPreview ? (
+            <View style={styles.menuSection}>
+              <Text style={styles.menuLabel}>Restore Preview</Text>
+              {backupConflict ? (
+                <Text style={styles.subtle}>
+                  Local activity is newer than this backup. Restoring will replace those changes.
+                </Text>
+              ) : null}
+              <Text style={styles.subtle}>Level {backupPreview.identityLevel}</Text>
+              <Text style={styles.subtle}>Effort {backupPreview.totalEffort}</Text>
+              <Text style={styles.subtle}>Habits {backupPreview.habits}</Text>
+              <Text style={styles.subtle}>Chests {backupPreview.chests}</Text>
+              <Text style={styles.subtle}>Items {backupPreview.items}</Text>
+              <Pressable
+                style={styles.button}
+                onPress={handleConfirmLoadBackup}
+                disabled={adminBusy}
+              >
+                <Text style={styles.buttonText}>
+                  {backupConflict ? 'Restore anyway' : 'Restore now'}
+                </Text>
+              </Pressable>
+              <Pressable
+                style={styles.buttonGhost}
+                onPress={handleCancelBackupPreview}
+                disabled={adminBusy}
+              >
+                <Text style={styles.buttonGhostText}>Cancel</Text>
+              </Pressable>
             </View>
           ) : null}
           <View style={styles.menuSection}>
@@ -1361,8 +2618,7 @@ export default function StatusScreen() {
           {accountMessage ? <Text style={styles.subtle}>{accountMessage}</Text> : null}
         </View>
       ) : null}
-
-      {showAdmin ? (
+{showAdmin ? (
         <View style={styles.panel}>
           <Text style={styles.panelTitle}>Admin Dashboard</Text>
           <Text style={styles.subtle}>
@@ -1379,155 +2635,391 @@ export default function StatusScreen() {
           ) : null}
           {adminStatus === 'signed_in' ? (
             <>
-              <Text style={styles.subtle}>Backups (Supabase)</Text>
-              <Pressable
-                style={styles.buttonGhost}
-                onPress={handleVerifyRls}
-                disabled={adminLoading}
-              >
-                <Text style={styles.buttonGhostText}>Verify RLS</Text>
-              </Pressable>
-              {rlsMessage ? <Text style={styles.subtle}>{rlsMessage}</Text> : null}
-              <View style={styles.habitInputRow}>
-                <TextInput
-                  value={adminFilter}
-                  onChangeText={setAdminFilter}
-                  placeholder="Filter by user id (optional)"
-                  placeholderTextColor="#4b5563"
-                  style={styles.input}
-                  autoCapitalize="none"
-                />
-                <Pressable
-                  style={styles.buttonSmall}
-                  onPress={handleRefreshBackups}
-                  disabled={adminLoading}
-                >
-                  <Text style={styles.buttonText}>Refresh</Text>
-                </Pressable>
+              <View style={styles.adminTabRow}>
+                {ADMIN_TABS.map((tab) => (
+                  <Pressable
+                    key={tab}
+                    style={[styles.adminTab, adminTab === tab && styles.adminTabActive]}
+                    onPress={() => setAdminTab(tab)}
+                  >
+                    <Text style={[styles.adminTabText, adminTab === tab && styles.adminTabTextActive]}>
+                      {tab}
+                    </Text>
+                  </Pressable>
+                ))}
               </View>
-              {adminBackups.length === 0 ? (
-                <Text style={styles.subtle}>No backups loaded yet.</Text>
-              ) : (
-                adminBackups.map((backup) => (
-                  <Pressable
-                    key={backup.user_id}
-                    style={[
-                      styles.adminRow,
-                      adminSelectedUserId === backup.user_id && styles.adminRowSelected,
-                    ]}
-                    onPress={() => {
-                      setAdminSelectedUserId(backup.user_id);
-                      setAdminSummary(null);
-                    }}
-                  >
-                    <View>
-                      <Text style={styles.adminRowTitle}>{backup.user_id}</Text>
-                      <Text style={styles.subtle}>
-                        Updated {new Date(backup.updated_at).toLocaleString()}
-                      </Text>
+
+              {adminTab === 'Overview' ? (
+                <View style={styles.adminGrid}>
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>Users</Text>
+                    <View style={styles.habitInputRow}>
+                      <TextInput
+                        value={adminUserSearch}
+                        onChangeText={setAdminUserSearch}
+                        placeholder="Search email"
+                        placeholderTextColor="#4b5563"
+                        style={styles.input}
+                        autoCapitalize="none"
+                      />
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={handleRefreshAdminOverview}
+                        disabled={adminLoading}
+                      >
+                        <Text style={styles.buttonText}>Load</Text>
+                      </Pressable>
                     </View>
-                  </Pressable>
-                ))
-              )}
-              {adminSelectedUserId ? (
-                <View style={styles.menuSection}>
-                  <Text style={styles.menuLabel}>Selected Backup</Text>
-                  <Text style={styles.subtle}>{adminSelectedUserId}</Text>
-                  <Pressable
-                    style={styles.button}
-                    onPress={handlePreviewBackup}
-                    disabled={adminLoading}
-                  >
-                    <Text style={styles.buttonText}>Preview summary</Text>
-                  </Pressable>
-                  <Pressable
-                    style={styles.buttonGhost}
-                    onPress={handleExportBackup}
-                    disabled={adminLoading}
-                  >
-                    <Text style={styles.buttonGhostText}>Export JSON</Text>
-                  </Pressable>
-                  <Pressable
-                    style={styles.buttonGhost}
-                    onPress={handleLoadBackupForUser}
-                    disabled={adminLoading}
-                  >
-                    <Text style={styles.buttonGhostText}>Load to this device</Text>
-                  </Pressable>
+                    <View style={styles.habitInputRow}>
+                      <TextInput
+                        value={adminUserIdSearch}
+                        onChangeText={setAdminUserIdSearch}
+                        placeholder="User id"
+                        placeholderTextColor="#4b5563"
+                        style={styles.input}
+                        autoCapitalize="none"
+                      />
+                    </View>
+                    <View style={styles.habitInputRow}>
+                      <TextInput
+                        value={adminDateFrom}
+                        onChangeText={setAdminDateFrom}
+                        placeholder="From (YYYY-MM-DD)"
+                        placeholderTextColor="#4b5563"
+                        style={styles.input}
+                        autoCapitalize="none"
+                      />
+                      <TextInput
+                        value={adminDateTo}
+                        onChangeText={setAdminDateTo}
+                        placeholder="To (YYYY-MM-DD)"
+                        placeholderTextColor="#4b5563"
+                        style={styles.input}
+                        autoCapitalize="none"
+                      />
+                    </View>
+                    {adminUsers.length === 0 ? (
+                      <Text style={styles.subtle}>No users loaded.</Text>
+                    ) : (
+                      adminUsers.map((user) => {
+                        const summary = adminSummaries.find(
+                          (item) => item.user_id === user.user_id
+                        );
+                        return (
+                          <View key={user.user_id} style={styles.adminRow}>
+                            <Text style={styles.adminRowTitle}>{user.email || user.user_id}</Text>
+                            <Text style={styles.subtle}>
+                              Last seen: {user.last_seen_at ? new Date(user.last_seen_at).toLocaleString() : '-'}
+                            </Text>
+                            {summary ? (
+                              <Text style={styles.subtle}>
+                                Effort {summary.total_effort || 0} - Habits {summary.habits || 0} -
+                                Chests {summary.chests || 0}
+                              </Text>
+                            ) : (
+                              <Text style={styles.subtle}>No summary yet.</Text>
+                            )}
+                          </View>
+                        );
+                      })
+                    )}
+                    <View style={styles.habitInputRow}>
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={() => {
+                          setAdminUserPage((prev) => Math.max(0, prev - 1));
+                          handleRefreshAdminOverview();
+                        }}
+                        disabled={adminLoading || adminUserPage === 0}
+                      >
+                        <Text style={styles.buttonText}>Prev</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={() => {
+                          setAdminUserPage((prev) => prev + 1);
+                          handleRefreshAdminOverview();
+                        }}
+                        disabled={adminLoading}
+                      >
+                        <Text style={styles.buttonText}>Next</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>System Health</Text>
+                    {adminEvents.length === 0 ? (
+                      <Text style={styles.subtle}>No events.</Text>
+                    ) : (
+                      adminEvents.map((event) => (
+                        <Text key={event.id} style={styles.subtle}>
+                          {new Date(event.created_at).toLocaleString()} - {event.type}
+                          {event.message ? ` - ${event.message}` : ''}
+                        </Text>
+                      ))
+                    )}
+                    <View style={styles.habitInputRow}>
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={() => {
+                          setAdminEventsPage((prev) => Math.max(0, prev - 1));
+                          handleRefreshAdminOverview();
+                        }}
+                        disabled={adminLoading || adminEventsPage === 0}
+                      >
+                        <Text style={styles.buttonText}>Prev</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={() => {
+                          setAdminEventsPage((prev) => prev + 1);
+                          handleRefreshAdminOverview();
+                        }}
+                        disabled={adminLoading}
+                      >
+                        <Text style={styles.buttonText}>Next</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>Admin Audit</Text>
+                    {adminAudit.length === 0 ? (
+                      <Text style={styles.subtle}>No admin actions logged.</Text>
+                    ) : (
+                      adminAudit.map((entry) => (
+                        <Text key={entry.id} style={styles.subtle}>
+                          {new Date(entry.created_at).toLocaleString()} - {entry.action}
+                          {entry.target_user_id ? ` - ${entry.target_user_id}` : ''}
+                        </Text>
+                      ))
+                    )}
+                    <View style={styles.habitInputRow}>
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={() => {
+                          setAdminAuditPage((prev) => Math.max(0, prev - 1));
+                          handleRefreshAdminOverview();
+                        }}
+                        disabled={adminLoading || adminAuditPage === 0}
+                      >
+                        <Text style={styles.buttonText}>Prev</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={() => {
+                          setAdminAuditPage((prev) => prev + 1);
+                          handleRefreshAdminOverview();
+                        }}
+                        disabled={adminLoading}
+                      >
+                        <Text style={styles.buttonText}>Next</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                </View>
+              ) : null}
+
+              {adminTab === 'Backups' ? (
+                <View style={styles.adminGrid}>
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>Backups</Text>
+                    <Pressable
+                      style={styles.buttonGhost}
+                      onPress={handleVerifyRls}
+                      disabled={adminLoading}
+                    >
+                      <Text style={styles.buttonGhostText}>Verify RLS</Text>
+                    </Pressable>
+                    {rlsMessage ? <Text style={styles.subtle}>{rlsMessage}</Text> : null}
+                    <View style={styles.habitInputRow}>
+                      <TextInput
+                        value={adminFilter}
+                        onChangeText={setAdminFilter}
+                        placeholder="Filter by user id"
+                        placeholderTextColor="#4b5563"
+                        style={styles.input}
+                        autoCapitalize="none"
+                      />
+                      <Pressable
+                        style={styles.buttonSmall}
+                        onPress={handleRefreshBackups}
+                        disabled={adminLoading}
+                      >
+                        <Text style={styles.buttonText}>Refresh</Text>
+                      </Pressable>
+                    </View>
+                    {adminBackups.length === 0 ? (
+                      <Text style={styles.subtle}>No backups loaded yet.</Text>
+                    ) : (
+                      adminBackups.map((backup) => (
+                        <Pressable
+                          key={backup.user_id}
+                          style={[
+                            styles.adminRow,
+                            adminSelectedUserId === backup.user_id && styles.adminRowSelected,
+                          ]}
+                          onPress={() => {
+                            setAdminSelectedUserId(backup.user_id);
+                            setAdminSummary(null);
+                            setAdminHistory([]);
+                          }}
+                        >
+                          <View>
+                            <Text style={styles.adminRowTitle}>{backup.user_id}</Text>
+                            <Text style={styles.subtle}>
+                              Updated {new Date(backup.updated_at).toLocaleString()}
+                            </Text>
+                          </View>
+                        </Pressable>
+                      ))
+                    )}
+                  </View>
+
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>Selected User</Text>
+                    {adminSelectedUserId ? (
+                      <>
+                        <Text style={styles.subtle}>{adminSelectedUserId}</Text>
+                        <Pressable
+                          style={styles.button}
+                          onPress={handlePreviewBackup}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonText}>Preview summary</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={handleLoadBackupHistoryForUser}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Load history</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={() => handleDeleteUserData('backup')}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Delete latest backup</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={() => handleDeleteUserData('history')}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Delete backup history</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={() => handleDeleteUserData('summary')}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Delete summary</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={() => handleDeleteUserData('events')}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Delete system events</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={() => handleDeleteUserData('profile')}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Delete profile</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={handleDeleteAllUserData}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Delete ALL user data</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={handleExportBackup}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Export JSON</Text>
+                        </Pressable>
+                        <Pressable
+                          style={styles.buttonGhost}
+                          onPress={handleLoadBackupForUser}
+                          disabled={adminLoading}
+                        >
+                          <Text style={styles.buttonGhostText}>Load to this device</Text>
+                        </Pressable>
+                      </>
+                    ) : (
+                      <Text style={styles.subtle}>Select a user to manage.</Text>
+                    )}
+                  </View>
+
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>History</Text>
+                    {adminHistory.length > 0 ? (
+                      adminHistory.map((entry) => (
+                        <View key={entry.id || entry.updatedAt} style={styles.menuSection}>
+                          <Text style={styles.subtle}>
+                            {new Date(entry.updatedAt).toLocaleString()}
+                            {entry.deviceId ? ` - ${entry.deviceId}` : ''}
+                            {entry.appVersion ? ` (v${entry.appVersion})` : ''}
+                          </Text>
+                          <View style={styles.habitInputRow}>
+                            <Pressable
+                              style={styles.buttonSmall}
+                              onPress={() => handleRestoreHistoryEntry(entry)}
+                              disabled={adminLoading}
+                            >
+                              <Text style={styles.buttonText}>Restore</Text>
+                            </Pressable>
+                            <Pressable
+                              style={styles.buttonSmall}
+                              onPress={() => handleExportHistoryEntry(entry)}
+                              disabled={adminLoading}
+                            >
+                              <Text style={styles.buttonText}>Export</Text>
+                            </Pressable>
+                          </View>
+                        </View>
+                      ))
+                    ) : (
+                      <Text style={styles.subtle}>No history loaded.</Text>
+                    )}
+                  </View>
+                </View>
+              ) : null}
+
+              {adminTab === 'Logs' ? (
+                <View style={styles.adminGrid}>
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>Recent Actions</Text>
+                    {adminLog.length > 0 ? (
+                      adminLog.map((entry, index) => (
+                        <Text key={`${entry.at}-${index}`} style={styles.subtle}>
+                          {new Date(entry.at).toLocaleString()} - {entry.label}
+                        </Text>
+                      ))
+                    ) : (
+                      <Text style={styles.subtle}>No recent actions.</Text>
+                    )}
+                  </View>
+                  <View style={styles.adminCard}>
+                    <Text style={styles.adminCardTitle}>Admin Message</Text>
+                    <Text style={styles.subtle}>{adminMessage || 'No messages.'}</Text>
+                  </View>
                 </View>
               ) : null}
             </>
-          ) : null}
-          {adminSummary ? (
-            <View style={styles.panelQuiet}>
-              <Text style={styles.panelTitle}>Summary</Text>
-              {adminSummary.encrypted ? (
-                <Text style={styles.subtle}>
-                  Encrypted backup. Provide the passphrase to load it on this device.
-                </Text>
-              ) : null}
-              <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Identity Level</Text>
-                <Text style={styles.statValue}>{adminSummary.identityLevel}</Text>
-              </View>
-              <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Total Effort</Text>
-                <Text style={styles.statValue}>{adminSummary.totalEffort}</Text>
-              </View>
-              <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Habits</Text>
-                <Text style={styles.statValue}>{adminSummary.habits}</Text>
-              </View>
-              <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Efforts</Text>
-                <Text style={styles.statValue}>{adminSummary.efforts}</Text>
-              </View>
-              <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Chests</Text>
-                <Text style={styles.statValue}>{adminSummary.chests}</Text>
-              </View>
-              <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Items</Text>
-                <Text style={styles.statValue}>{adminSummary.items}</Text>
-              </View>
-              <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Payload (bytes)</Text>
-                <Text style={styles.statValue}>{adminSummary.payloadBytes}</Text>
-              </View>
-              <Text style={styles.subtle}>
-                Updated {new Date(adminSummary.updatedAt).toLocaleString()}
-              </Text>
-            </View>
-          ) : null}
-          <Pressable
-            style={styles.buttonGhost}
-            onPress={handleSaveBackup}
-            disabled={adminBusy}
-          >
-            <Text style={styles.buttonGhostText}>Save current device backup</Text>
-          </Pressable>
-          <Pressable
-            style={styles.buttonGhost}
-            onPress={handleLoadBackup}
-            disabled={adminBusy}
-          >
-            <Text style={styles.buttonGhostText}>Load my backup to this device</Text>
-          </Pressable>
-          {adminLog.length > 0 ? (
-            <View style={styles.menuSection}>
-              <Text style={styles.menuLabel}>Recent Actions</Text>
-              {adminLog.map((entry, index) => (
-                <Text key={`${entry.at}-${index}`} style={styles.subtle}>
-                  {new Date(entry.at).toLocaleString()} - {entry.label}
-                </Text>
-              ))}
-            </View>
           ) : null}
           {adminMessage ? <Text style={styles.subtle}>{adminMessage}</Text> : null}
         </View>
       ) : null}
 
-      {showTasks ? (
+                    {showTasks ? (
         <View style={[styles.panel, styles.panelTight]}>
           <Text style={styles.panelTitle}>Habits</Text>
           {habits.length === 0 ? (
@@ -1622,6 +3114,12 @@ export default function StatusScreen() {
               {chests.map((chest) => (
                 <View key={chest.id} style={styles.gridCard}>
                   <Text style={styles.rarityTitle}>{chest.rarity.toUpperCase()}</Text>
+                  {chest.theme ? (
+                    <Text style={styles.gridSubtle}>Theme: {chest.theme}</Text>
+                  ) : null}
+                  {chest.habitName ? (
+                    <Text style={styles.gridSubtle}>From {chest.habitName}</Text>
+                  ) : null}
                   <Text style={styles.gridSubtle}>{chest.rewardCount} rewards</Text>
                   <Text style={styles.gridSubtle}>{chest.lockedCount} locked</Text>
                 </View>
@@ -1918,16 +3416,22 @@ export default function StatusScreen() {
 
       <View style={styles.layout}>
         <View style={styles.sidePanel}>
-          <Text style={styles.panelTitle}>Quest Log</Text>
+          <Text style={styles.panelTitle}>Status Log</Text>
           <View style={styles.sideBlock}>
-            <Text style={styles.sideLabel}>Daily Goal</Text>
-            <Text style={styles.sideValue}>{activeHabits} Active Habits</Text>
-            <Text style={styles.sideMeta}>Next action: log effort</Text>
+            <Text style={styles.sideLabel}>Evidence</Text>
+            <Text style={styles.sideValue}>
+              {identity ? `Level ${identity.level}` : 'Level 1'}
+            </Text>
+            <Text style={styles.sideMeta}>
+              {identity ? `${identity.totalEffortUnits} total effort` : '0 total effort'}
+            </Text>
           </View>
           <View style={styles.sideBlock}>
-            <Text style={styles.sideLabel}>Timer</Text>
-            <Text style={styles.sideValue}>01:39:08</Text>
-            <Text style={styles.sideMeta}>Placeholder countdown</Text>
+            <Text style={styles.sideLabel}>Re-entry</Text>
+            <Text style={styles.sideValue}>{isQuietMode ? 'Quiet' : 'Standard'}</Text>
+            <Text style={styles.sideMeta}>
+              {isQuietMode ? 'Lower friction mode' : 'Standard mode'}
+            </Text>
           </View>
           <View style={styles.sideBlock}>
             <Text style={styles.sideLabel}>Mercy</Text>
@@ -2763,6 +4267,86 @@ const styles = StyleSheet.create({
     color: '#eaf4ff',
     fontSize: 12,
     fontWeight: '700',
+  },
+  adminTabRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 12,
+  },
+  adminTab: {
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: '#0a152c',
+  },
+  adminTabActive: {
+    borderColor: '#7bc7ff',
+    backgroundColor: '#102244',
+  },
+  adminTabText: {
+    color: '#c7e2ff',
+    fontSize: 12,
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+  },
+  adminTabTextActive: {
+    color: '#ffffff',
+    fontWeight: '700',
+  },
+  adminGrid: {
+    gap: 12,
+  },
+  adminCard: {
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    borderRadius: 12,
+    padding: 14,
+    backgroundColor: '#0a152c',
+  },
+  adminCardTitle: {
+    color: '#9fe1ff',
+    fontSize: FONT.sm,
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+    marginBottom: 8,
+  },
+  helpTabRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 12,
+  },
+  helpTab: {
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    borderRadius: 10,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    backgroundColor: '#0a152c',
+  },
+  helpTabActive: {
+    borderColor: '#7bc7ff',
+    backgroundColor: '#102244',
+  },
+  helpTabText: {
+    color: '#c7e2ff',
+    fontSize: 11,
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+  },
+  helpTabTextActive: {
+    color: '#ffffff',
+    fontWeight: '700',
+  },
+  helpCard: {
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    borderRadius: 12,
+    padding: 14,
+    backgroundColor: '#0a152c',
+    marginBottom: 10,
   },
   turnstileContainer: {
     alignSelf: 'stretch',

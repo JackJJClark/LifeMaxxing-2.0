@@ -1,10 +1,14 @@
 import { Platform } from 'react-native';
 import * as SQLite from 'expo-sqlite';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const DB_NAME = 'lifemaxing.db';
 const isWeb = Platform.OS === 'web';
 const db = isWeb ? null : SQLite.openDatabase(DB_NAME);
 const WEB_STORE_KEY = 'lifemaxing.webstore.v1';
+const DEVICE_ID_KEY = 'lifemaxing.deviceId.v1';
+const SCHEMA_VERSION = 1;
+const APP_VERSION = process.env.EXPO_PUBLIC_APP_VERSION || '';
 
 const webStore = {
   identity: null,
@@ -13,6 +17,7 @@ const webStore = {
   chests: [],
   items: [],
   chestRewards: [],
+  chestMeta: [],
   combatEncounters: [],
   mercyEvents: [],
   habitEffortCache: {},
@@ -35,6 +40,7 @@ function loadWebStore() {
     webStore.chests = Array.isArray(data.chests) ? data.chests : [];
     webStore.items = Array.isArray(data.items) ? data.items : [];
     webStore.chestRewards = Array.isArray(data.chestRewards) ? data.chestRewards : [];
+    webStore.chestMeta = Array.isArray(data.chestMeta) ? data.chestMeta : [];
     webStore.combatEncounters = Array.isArray(data.combatEncounters)
       ? data.combatEncounters
       : [];
@@ -65,6 +71,7 @@ function saveWebStore() {
       chests: webStore.chests,
       items: webStore.items,
       chestRewards: webStore.chestRewards,
+      chestMeta: webStore.chestMeta,
       combatEncounters: webStore.combatEncounters,
       mercyEvents: webStore.mercyEvents,
       habitEffortCache: webStore.habitEffortCache,
@@ -89,6 +96,30 @@ function nowIso() {
 function makeId(prefix) {
   const rand = Math.random().toString(36).slice(2, 10);
   return `${prefix}_${Date.now().toString(36)}_${rand}`;
+}
+
+async function getOrCreateDeviceId() {
+  if (isWeb) {
+    if (!canUseWebStorage()) return makeId('device');
+    try {
+      const existing = window.localStorage.getItem(DEVICE_ID_KEY);
+      if (existing) return existing;
+      const created = makeId('device');
+      window.localStorage.setItem(DEVICE_ID_KEY, created);
+      return created;
+    } catch (error) {
+      return makeId('device');
+    }
+  }
+  try {
+    const existing = await AsyncStorage.getItem(DEVICE_ID_KEY);
+    if (existing) return existing;
+    const created = makeId('device');
+    await AsyncStorage.setItem(DEVICE_ID_KEY, created);
+    return created;
+  } catch (error) {
+    return makeId('device');
+  }
 }
 
 function execSql(sql, params = []) {
@@ -270,6 +301,20 @@ function matchPrevalence(habitName) {
   return { prevalence: 30, source: 'default_estimate' };
 }
 
+function deriveChestTheme(habitName) {
+  const text = normalizeHabitKey(habitName || '');
+  if (!text) return 'resolve';
+  if (text.includes('sleep') || text.includes('rest')) return 'restore';
+  if (text.includes('water') || text.includes('hydrate')) return 'clarity';
+  if (text.includes('meditate') || text.includes('mind')) return 'calm';
+  if (text.includes('walk') || text.includes('run') || text.includes('cardio')) return 'stride';
+  if (text.includes('gym') || text.includes('lift') || text.includes('strength')) return 'vigor';
+  if (text.includes('yoga')) return 'balance';
+  if (text.includes('read')) return 'insight';
+  if (text.includes('meal') || text.includes('protein') || text.includes('nutrition')) return 'nourish';
+  return 'resolve';
+}
+
 export async function initDb() {
   if (isWeb) {
     loadWebStore();
@@ -334,6 +379,19 @@ export async function initDb() {
       locked INTEGER NOT NULL,
       FOREIGN KEY (chestId) REFERENCES chests (id),
       FOREIGN KEY (itemId) REFERENCES items (id)
+    )`
+  );
+
+  await execSql(
+    `CREATE TABLE IF NOT EXISTS chest_meta (
+      chestId TEXT PRIMARY KEY NOT NULL,
+      habitId TEXT,
+      habitName TEXT,
+      effortValue INTEGER,
+      consistencyCount INTEGER,
+      theme TEXT,
+      createdAt TEXT NOT NULL,
+      FOREIGN KEY (chestId) REFERENCES chests (id)
     )`
   );
 
@@ -600,7 +658,7 @@ async function createItemRecord(item) {
   return id;
 }
 
-async function createChestRewards(chestId, rarity) {
+async function createChestRewards(chestId, rarity, consistencyCount = 0) {
   const rewardCount =
     rarity === 'mythic'
       ? 3
@@ -611,8 +669,16 @@ async function createChestRewards(chestId, rarity) {
         ? 1
         : 2
       : 1;
+  let bonus = 0;
+  if (consistencyCount >= 7 && Math.random() < 0.5) {
+    bonus += 1;
+  }
+  if (consistencyCount >= 5 && Math.random() < 0.4) {
+    bonus += 1;
+  }
+  const totalRewards = rewardCount + bonus;
 
-  for (let i = 0; i < rewardCount; i += 1) {
+  for (let i = 0; i < totalRewards; i += 1) {
     const item = generateItem(rarity);
     const itemId = await createItemRecord(item);
     const rewardId = makeId('reward');
@@ -690,11 +756,12 @@ async function updateIdentityTotals(effortValue) {
   );
 }
 
-export async function logEffort({ habitId, effortValue, note }) {
+export async function logEffort({ habitId, note }) {
   const id = makeId('effort');
   const timestamp = nowIso();
   const inactivityDays = await getInactivityDays();
   const resolvedEffort = await resolveEffortValue(habitId);
+  const habitName = await getHabitNameById(habitId);
 
   if (isWeb) {
     webStore.effortLogs.push({
@@ -732,7 +799,24 @@ export async function logEffort({ habitId, effortValue, note }) {
       [chestId, rarity, timestamp]
     );
   }
-  await createChestRewards(chestId, rarity);
+  const chestTheme = deriveChestTheme(habitName);
+  if (isWeb) {
+    webStore.chestMeta.push({
+      chestId,
+      habitId,
+      habitName: habitName || null,
+      effortValue: resolvedEffort,
+      consistencyCount: consistency,
+      theme: chestTheme,
+      createdAt: timestamp,
+    });
+  } else {
+    await execSql(
+      'INSERT INTO chest_meta (chestId, habitId, habitName, effortValue, consistencyCount, theme, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [chestId, habitId, habitName || null, resolvedEffort, consistency, chestTheme, timestamp]
+    );
+  }
+  await createChestRewards(chestId, rarity, consistency);
   if (mercy.bypassUnlock) {
     if (isWeb) {
       const reward = webStore.chestRewards.find(
@@ -771,6 +855,7 @@ export async function listChests(limit = 5) {
     return sorted.slice(0, limit).map((chest) => {
       const rewards = webStore.chestRewards.filter((item) => item.chestId === chest.id);
       const locked = rewards.filter((item) => item.locked);
+      const meta = webStore.chestMeta.find((item) => item.chestId === chest.id) || null;
       return {
         id: chest.id,
         rarity: chest.rarity,
@@ -778,14 +863,19 @@ export async function listChests(limit = 5) {
         unlockedRewardCount: chest.unlockedRewardCount,
         rewardCount: rewards.length,
         lockedCount: locked.length,
+        theme: meta?.theme || null,
+        habitName: meta?.habitName || null,
       };
     });
   }
   const result = await execSql(
     `SELECT c.id, c.rarity, c.earnedAt, c.unlockedRewardCount,
       (SELECT COUNT(*) FROM chest_rewards cr WHERE cr.chestId = c.id) as rewardCount,
-      (SELECT COUNT(*) FROM chest_rewards cr WHERE cr.chestId = c.id AND cr.locked = 1) as lockedCount
+      (SELECT COUNT(*) FROM chest_rewards cr WHERE cr.chestId = c.id AND cr.locked = 1) as lockedCount,
+      m.theme as theme,
+      m.habitName as habitName
      FROM chests c
+     LEFT JOIN chest_meta m ON m.chestId = c.id
      ORDER BY c.earnedAt DESC
      LIMIT ?`,
     [limit]
@@ -1062,14 +1152,23 @@ export async function getStatusSnapshot() {
 }
 
 export async function exportAllData() {
+  const deviceId = await getOrCreateDeviceId();
+  const meta = {
+    schemaVersion: SCHEMA_VERSION,
+    createdAt: nowIso(),
+    deviceId,
+    appVersion: APP_VERSION || null,
+  };
   if (isWeb) {
     return {
+      meta,
       identity: webStore.identity,
       habits: [...webStore.habits],
       effortLogs: [...webStore.effortLogs],
       chests: [...webStore.chests],
       items: [...webStore.items],
       chestRewards: [...webStore.chestRewards],
+      chestMeta: [...webStore.chestMeta],
       combatEncounters: [...webStore.combatEncounters],
       mercyEvents: [...webStore.mercyEvents],
       habitEffortCache: Object.values(webStore.habitEffortCache),
@@ -1082,17 +1181,20 @@ export async function exportAllData() {
   const chests = await fetchAllRows('SELECT * FROM chests');
   const items = await fetchAllRows('SELECT * FROM items');
   const chestRewards = await fetchAllRows('SELECT * FROM chest_rewards');
+  const chestMeta = await fetchAllRows('SELECT * FROM chest_meta');
   const combatEncounters = await fetchAllRows('SELECT * FROM combat_encounters');
   const mercyEvents = await fetchAllRows('SELECT * FROM mercy_events');
   const habitEffortCache = await fetchAllRows('SELECT * FROM habit_effort_cache');
 
   return {
+    meta,
     identity: identityRows.length ? identityRows[0] : null,
     habits,
     effortLogs,
     chests,
     items,
     chestRewards,
+    chestMeta,
     combatEncounters,
     mercyEvents,
     habitEffortCache,
@@ -1107,6 +1209,7 @@ export async function clearAllData() {
     webStore.chests = [];
     webStore.items = [];
     webStore.chestRewards = [];
+    webStore.chestMeta = [];
     webStore.combatEncounters = [];
     webStore.mercyEvents = [];
     webStore.habitEffortCache = {};
@@ -1114,6 +1217,7 @@ export async function clearAllData() {
     return;
   }
   await execSql('DELETE FROM chest_rewards');
+  await execSql('DELETE FROM chest_meta');
   await execSql('DELETE FROM combat_encounters');
   await execSql('DELETE FROM effort_logs');
   await execSql('DELETE FROM items');
@@ -1126,6 +1230,7 @@ export async function clearAllData() {
 
 export async function importAllData(payload) {
   if (!payload) return;
+  const meta = payload.meta || null;
   if (isWeb) {
     webStore.identity = payload.identity || null;
     webStore.habits = payload.habits ? [...payload.habits] : [];
@@ -1133,6 +1238,7 @@ export async function importAllData(payload) {
     webStore.chests = payload.chests ? [...payload.chests] : [];
     webStore.items = payload.items ? [...payload.items] : [];
     webStore.chestRewards = payload.chestRewards ? [...payload.chestRewards] : [];
+    webStore.chestMeta = payload.chestMeta ? [...payload.chestMeta] : [];
     webStore.combatEncounters = payload.combatEncounters
       ? [...payload.combatEncounters]
       : [];
@@ -1178,6 +1284,21 @@ export async function importAllData(payload) {
     await execSql(
       'INSERT INTO chests (id, rarity, earnedAt, unlockedRewardCount) VALUES (?, ?, ?, ?)',
       [chest.id, chest.rarity, chest.earnedAt, chest.unlockedRewardCount || 0]
+    );
+  }
+
+  for (const metaRow of payload.chestMeta || []) {
+    await execSql(
+      'INSERT INTO chest_meta (chestId, habitId, habitName, effortValue, consistencyCount, theme, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [
+        metaRow.chestId,
+        metaRow.habitId || null,
+        metaRow.habitName || null,
+        metaRow.effortValue || null,
+        metaRow.consistencyCount || null,
+        metaRow.theme || null,
+        metaRow.createdAt || nowIso(),
+      ]
     );
   }
 
