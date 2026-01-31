@@ -16,8 +16,10 @@ const webStore = {
   effortLogs: [],
   chests: [],
   items: [],
+  cards: [],
   chestRewards: [],
   chestMeta: [],
+  arcQuestProgress: [],
   combatEncounters: [],
   mercyEvents: [],
   habitEffortCache: {},
@@ -39,8 +41,12 @@ function loadWebStore() {
     webStore.effortLogs = Array.isArray(data.effortLogs) ? data.effortLogs : [];
     webStore.chests = Array.isArray(data.chests) ? data.chests : [];
     webStore.items = Array.isArray(data.items) ? data.items : [];
+    webStore.cards = Array.isArray(data.cards) ? data.cards : [];
     webStore.chestRewards = Array.isArray(data.chestRewards) ? data.chestRewards : [];
     webStore.chestMeta = Array.isArray(data.chestMeta) ? data.chestMeta : [];
+    webStore.arcQuestProgress = Array.isArray(data.arcQuestProgress)
+      ? data.arcQuestProgress
+      : [];
     webStore.combatEncounters = Array.isArray(data.combatEncounters)
       ? data.combatEncounters
       : [];
@@ -70,8 +76,10 @@ function saveWebStore() {
       effortLogs: webStore.effortLogs,
       chests: webStore.chests,
       items: webStore.items,
+      cards: webStore.cards,
       chestRewards: webStore.chestRewards,
       chestMeta: webStore.chestMeta,
+      arcQuestProgress: webStore.arcQuestProgress,
       combatEncounters: webStore.combatEncounters,
       mercyEvents: webStore.mercyEvents,
       habitEffortCache: webStore.habitEffortCache,
@@ -84,6 +92,136 @@ function saveWebStore() {
 
 const EFFORT_UNITS_PER_LEVEL = 10;
 const CONSISTENCY_WINDOW_DAYS = 7;
+const RARITY_TIERS = ['common', 'uncommon', 'rare', 'epic', 'relic'];
+const CHEST_TIERS = ['weathered', 'sealed', 'engraved', 'runed', 'ancient'];
+const CHEST_TIER_LABELS = {
+  weathered: 'Weathered',
+  sealed: 'Sealed',
+  engraved: 'Engraved',
+  runed: 'Runed',
+  ancient: 'Ancient',
+};
+
+const ITEM_CATALOG = [
+  {
+    key: 'worn_compass',
+    name: 'Worn Compass',
+    rarity: 'uncommon',
+    effect: 'Slightly improves chest quality after long inactivity.',
+  },
+  {
+    key: 'fractured_hourglass',
+    name: 'Fractured Hourglass',
+    rarity: 'rare',
+    effect: 'Long encounters can pause safely without friction.',
+  },
+  {
+    key: 'quiet_token',
+    name: 'Quiet Token',
+    rarity: 'common',
+    effect: 'UI noise softens after missed days.',
+  },
+  {
+    key: 'ember_thread',
+    name: 'Ember Thread',
+    rarity: 'uncommon',
+    effect: 'Low-effort actions feel more impactful in combat expression.',
+  },
+  {
+    key: 'old_journal_page',
+    name: 'Old Journal Page',
+    rarity: 'rare',
+    effect: 'Effort memory reflections appear more often.',
+  },
+  {
+    key: 'rusty_key',
+    name: 'Rusty Key',
+    rarity: 'epic',
+    effect: 'Unlocks one locked chest reward without combat (rare use).',
+  },
+  {
+    key: 'anchor_stone',
+    name: 'Anchor Stone',
+    rarity: 'epic',
+    effect: 'Stabilizes consistency-based rarity rolls.',
+  },
+];
+
+const CARD_CATALOG = [
+  {
+    key: 'return_signal',
+    name: 'Return Signal',
+    rarity: 'uncommon',
+    effect: 'When you log effort after inactivity, gain a small combat bonus.',
+  },
+  {
+    key: 'first_loss_mercy',
+    name: 'First Loss Mercy',
+    rarity: 'rare',
+    effect: 'Your first combat loss each day has no effect on reward unlocking.',
+  },
+  {
+    key: 'quiet_stability',
+    name: 'Quiet Stability',
+    rarity: 'common',
+    effect: 'Low-effort actions slightly improve chest stability.',
+  },
+  {
+    key: 'return_slot',
+    name: 'Return Slot',
+    rarity: 'epic',
+    effect: 'When returning after a break, unlock one additional reward slot.',
+  },
+  {
+    key: 'steady_encounters',
+    name: 'Steady Encounters',
+    rarity: 'uncommon',
+    effect: 'Combat encounters feel slightly easier when effort is logged consistently.',
+  },
+];
+
+const ARC_QUESTS = [
+  {
+    id: 'arc_echoes',
+    title: 'Show Up Again',
+    theme: 'Identity',
+    summary: 'This arc tracks your general effort and reminds you that returning counts.',
+    milestones: [15, 35, 70, 120],
+    fragments: [
+      'You logged effort again after a break.',
+      'You have shown up on multiple days.',
+      'Your effort is becoming a pattern you can trust.',
+      'You have built a stable rhythm over time.',
+    ],
+  },
+  {
+    id: 'arc_stillwater',
+    title: 'Keep the Thread',
+    theme: 'Consistency',
+    summary: 'This arc advances whenever you log effort, no deadlines, no streaks.',
+    milestones: [10, 28, 60, 100],
+    fragments: [
+      'You logged effort on multiple days.',
+      'You are building a baseline of consistency.',
+      'You returned after gaps without losing progress.',
+      'Your consistency is now a long-term habit.',
+    ],
+  },
+  {
+    id: 'arc_vigil',
+    title: 'Care for Energy',
+    theme: 'Vitality',
+    summary: 'This arc reflects effort and recovery without pressure.',
+    milestones: [20, 45, 85, 130],
+    fragments: [
+      'You kept going without forcing a streak.',
+      'You made progress even when energy was low.',
+      'You returned after rest and kept moving.',
+      'You have built a steady relationship with effort.',
+    ],
+  },
+];
+
 const ITEM_TYPES = ['sigil', 'token', 'relic', 'glyph', 'thread'];
 const ITEM_MODIFIERS = ['calm', 'focus', 'resolve', 'patience', 'clarity', 'grit'];
 const MERCY_COOLDOWN_DAYS = 30;
@@ -141,6 +279,14 @@ function execSql(sql, params = []) {
   });
 }
 
+async function ensureColumn(table, column, definition) {
+  try {
+    await execSql(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  } catch (error) {
+    // Column likely exists; ignore.
+  }
+}
+
 function randomFrom(list) {
   return list[Math.floor(Math.random() * list.length)];
 }
@@ -154,18 +300,45 @@ function generateModifiers() {
   return Array.from(picked).map((value) => `+${value}`);
 }
 
-function generateItem(rarity) {
+function generateItemLegacy(rarity) {
   const type = randomFrom(ITEM_TYPES);
   const modifiers = generateModifiers();
-  const tag = rarity === 'mythic' ? 'radiant' : rarity === 'rare' ? 'glow' : 'quiet';
+  const tag = rarity === 'relic' ? 'radiant' : rarity === 'rare' ? 'glow' : 'quiet';
   return { type, modifiers, tag };
 }
 
+function pickCatalogByRarity(catalog, rarity) {
+  const index = RARITY_TIERS.indexOf(rarity);
+  if (index === -1) return randomFrom(catalog);
+  const eligible = catalog.filter((item) => RARITY_TIERS.indexOf(item.rarity) <= index);
+  if (eligible.length === 0) return randomFrom(catalog);
+  return randomFrom(eligible);
+}
+
+function generateItem(rarity) {
+  const item = pickCatalogByRarity(ITEM_CATALOG, rarity);
+  return {
+    name: item.name,
+    rarity: item.rarity,
+    effect: item.effect,
+    meta: { key: item.key },
+  };
+}
+
+function generateCard(rarity) {
+  const card = pickCatalogByRarity(CARD_CATALOG, rarity);
+  return {
+    name: card.name,
+    rarity: card.rarity,
+    effect: card.effect,
+    key: card.key,
+  };
+}
+
 function bumpRarity(rarity) {
-  const tiers = ['common', 'uncommon', 'rare', 'mythic'];
-  const index = tiers.indexOf(rarity);
+  const index = RARITY_TIERS.indexOf(rarity);
   if (index === -1) return rarity;
-  return tiers[Math.min(index + 1, tiers.length - 1)];
+  return RARITY_TIERS[Math.min(index + 1, RARITY_TIERS.length - 1)];
 }
 
 async function getLastMercyAt() {
@@ -357,6 +530,7 @@ export async function initDb() {
     `CREATE TABLE IF NOT EXISTS chests (
       id TEXT PRIMARY KEY NOT NULL,
       rarity TEXT NOT NULL,
+      tier TEXT,
       earnedAt TEXT NOT NULL,
       unlockedRewardCount INTEGER NOT NULL DEFAULT 0
     )`
@@ -367,6 +541,10 @@ export async function initDb() {
       id TEXT PRIMARY KEY NOT NULL,
       type TEXT NOT NULL,
       modifiersJson TEXT NOT NULL,
+      name TEXT,
+      rarity TEXT,
+      effect TEXT,
+      metaJson TEXT,
       createdAt TEXT NOT NULL
     )`
   );
@@ -375,10 +553,31 @@ export async function initDb() {
     `CREATE TABLE IF NOT EXISTS chest_rewards (
       id TEXT PRIMARY KEY NOT NULL,
       chestId TEXT NOT NULL,
-      itemId TEXT NOT NULL,
+      itemId TEXT,
+      rewardType TEXT,
+      rewardId TEXT,
       locked INTEGER NOT NULL,
       FOREIGN KEY (chestId) REFERENCES chests (id),
       FOREIGN KEY (itemId) REFERENCES items (id)
+    )`
+  );
+
+  await execSql(
+    `CREATE TABLE IF NOT EXISTS cards (
+      id TEXT PRIMARY KEY NOT NULL,
+      cardKey TEXT NOT NULL,
+      rarity TEXT NOT NULL,
+      createdAt TEXT NOT NULL,
+      chestId TEXT
+    )`
+  );
+
+  await execSql(
+    `CREATE TABLE IF NOT EXISTS arc_quest_progress (
+      arcId TEXT PRIMARY KEY NOT NULL,
+      progress INTEGER NOT NULL,
+      unlockedCount INTEGER NOT NULL,
+      updatedAt TEXT NOT NULL
     )`
   );
 
@@ -423,6 +622,14 @@ export async function initDb() {
       updatedAt TEXT NOT NULL
     )`
   );
+
+  await ensureColumn('chests', 'tier', 'TEXT');
+  await ensureColumn('items', 'name', 'TEXT');
+  await ensureColumn('items', 'rarity', 'TEXT');
+  await ensureColumn('items', 'effect', 'TEXT');
+  await ensureColumn('items', 'metaJson', 'TEXT');
+  await ensureColumn('chest_rewards', 'rewardType', 'TEXT');
+  await ensureColumn('chest_rewards', 'rewardId', 'TEXT');
 }
 
 export async function getHabitEffortForName(habitName) {
@@ -638,61 +845,118 @@ export async function deleteHabit(habitId) {
 }
 
 async function createItemRecord(item) {
+  const createdAt = nowIso();
+  const legacyFallback = generateItemLegacy(item.rarity || 'common');
+  const name = item.name || legacyFallback.type;
+  const rarity = item.rarity || 'common';
+  const effect = item.effect || legacyFallback.modifiers.join(' ');
+  const metaJson = JSON.stringify(item.meta || {});
+  const modifiersJson = JSON.stringify(
+    item.modifiersJson
+      ? item.modifiersJson
+      : { modifiers: legacyFallback.modifiers, tag: legacyFallback.tag }
+  );
   if (isWeb) {
     const id = makeId('item');
-    const createdAt = nowIso();
     webStore.items.push({
       id,
-      type: item.type,
-      modifiersJson: JSON.stringify({ modifiers: item.modifiers, tag: item.tag }),
+      type: item.type || legacyFallback.type,
+      modifiersJson,
+      name,
+      rarity,
+      effect,
+      metaJson,
       createdAt,
     });
     return id;
   }
   const id = makeId('item');
-  const createdAt = nowIso();
   await execSql(
-    'INSERT INTO items (id, type, modifiersJson, createdAt) VALUES (?, ?, ?, ?)',
-    [id, item.type, JSON.stringify({ modifiers: item.modifiers, tag: item.tag }), createdAt]
+    'INSERT INTO items (id, type, modifiersJson, name, rarity, effect, metaJson, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [id, item.type || legacyFallback.type, modifiersJson, name, rarity, effect, metaJson, createdAt]
   );
   return id;
 }
 
-async function createChestRewards(chestId, rarity, consistencyCount = 0) {
-  const rewardCount =
-    rarity === 'mythic'
-      ? 3
-      : rarity === 'rare'
-      ? 2
-      : rarity === 'uncommon'
-      ? Math.random() < 0.5
-        ? 1
-        : 2
-      : 1;
+async function createCardRecord(card, chestId = null) {
+  const id = makeId('card');
+  const createdAt = nowIso();
+  if (isWeb) {
+    webStore.cards.push({
+      id,
+      cardKey: card.key,
+      rarity: card.rarity,
+      createdAt,
+      chestId,
+    });
+    return id;
+  }
+  await execSql(
+    'INSERT INTO cards (id, cardKey, rarity, createdAt, chestId) VALUES (?, ?, ?, ?, ?)',
+    [id, card.key, card.rarity, createdAt, chestId]
+  );
+  return id;
+}
+
+function rewardCountForTier(tier) {
+  switch (tier) {
+    case 'ancient':
+      return 3;
+    case 'runed':
+      return 3;
+    case 'engraved':
+      return 2;
+    case 'sealed':
+      return Math.random() < 0.5 ? 1 : 2;
+    default:
+      return 1;
+  }
+}
+
+function pickRewardType(tier) {
+  if (tier === 'ancient' && Math.random() < 0.6) return 'card';
+  if (tier === 'runed' && Math.random() < 0.5) return 'card';
+  if (tier === 'engraved' && Math.random() < 0.4) return 'card';
+  return Math.random() < 0.25 ? 'card' : 'item';
+}
+
+async function createChestRewards(chestId, rarity, consistencyCount = 0, tier = 'weathered') {
+  const rewardCount = rewardCountForTier(tier);
   let bonus = 0;
   if (consistencyCount >= 7 && Math.random() < 0.5) {
     bonus += 1;
   }
-  if (consistencyCount >= 5 && Math.random() < 0.4) {
+  if (consistencyCount >= 5 && Math.random() < 0.35) {
     bonus += 1;
   }
   const totalRewards = rewardCount + bonus;
 
   for (let i = 0; i < totalRewards; i += 1) {
-    const item = generateItem(rarity);
-    const itemId = await createItemRecord(item);
     const rewardId = makeId('reward');
+    const rewardType = pickRewardType(tier);
+    let rewardRef = null;
+    let itemId = null;
+    if (rewardType === 'card') {
+      const card = generateCard(rarity);
+      rewardRef = await createCardRecord(card, chestId);
+    } else {
+      const item = generateItem(rarity);
+      itemId = await createItemRecord(item);
+      rewardRef = itemId;
+    }
     if (isWeb) {
       webStore.chestRewards.push({
         id: rewardId,
         chestId,
         itemId,
+        rewardType,
+        rewardId: rewardRef,
         locked: true,
       });
     } else {
       await execSql(
-        'INSERT INTO chest_rewards (id, chestId, itemId, locked) VALUES (?, ?, ?, 1)',
-        [rewardId, chestId, itemId]
+        'INSERT INTO chest_rewards (id, chestId, itemId, rewardType, rewardId, locked) VALUES (?, ?, ?, ?, ?, 1)',
+        [rewardId, chestId, itemId, rewardType, rewardRef]
       );
     }
   }
@@ -717,10 +981,19 @@ async function getConsistencyScore() {
 }
 
 function rarityFromConsistency(count) {
-  if (count >= 7) return 'mythic';
+  if (count >= 7) return 'relic';
+  if (count >= 6) return 'epic';
   if (count >= 5) return 'rare';
   if (count >= 3) return 'uncommon';
   return 'common';
+}
+
+function chestTierFromConsistency(count) {
+  if (count >= 7) return 'ancient';
+  if (count >= 6) return 'runed';
+  if (count >= 5) return 'engraved';
+  if (count >= 3) return 'sealed';
+  return 'weathered';
 }
 
 async function fetchAllRows(sql, params = []) {
@@ -756,6 +1029,99 @@ async function updateIdentityTotals(effortValue) {
   );
 }
 
+function unlockedCountForQuest(quest, progress) {
+  return quest.milestones.filter((threshold) => progress >= threshold).length;
+}
+
+async function ensureArcQuestProgress() {
+  if (isWeb) {
+    const map = new Map(webStore.arcQuestProgress.map((row) => [row.arcId, row]));
+    ARC_QUESTS.forEach((quest) => {
+      if (!map.has(quest.id)) {
+        const record = {
+          arcId: quest.id,
+          progress: 0,
+          unlockedCount: 0,
+          updatedAt: nowIso(),
+        };
+        webStore.arcQuestProgress.push(record);
+        map.set(quest.id, record);
+      }
+    });
+    return map;
+  }
+
+  const rows = await fetchAllRows('SELECT arcId, progress, unlockedCount, updatedAt FROM arc_quest_progress');
+  const map = new Map(rows.map((row) => [row.arcId, row]));
+  for (const quest of ARC_QUESTS) {
+    if (!map.has(quest.id)) {
+      const record = {
+        arcId: quest.id,
+        progress: 0,
+        unlockedCount: 0,
+        updatedAt: nowIso(),
+      };
+      await execSql(
+        'INSERT INTO arc_quest_progress (arcId, progress, unlockedCount, updatedAt) VALUES (?, ?, ?, ?)',
+        [record.arcId, record.progress, record.unlockedCount, record.updatedAt]
+      );
+      map.set(quest.id, record);
+    }
+  }
+  return map;
+}
+
+export async function listArcQuestStatus() {
+  const progressMap = await ensureArcQuestProgress();
+  return ARC_QUESTS.map((quest) => {
+    const record = progressMap.get(quest.id);
+    const progress = record ? record.progress : 0;
+    const unlockedCount = record ? record.unlockedCount : 0;
+    const nextMilestone = quest.milestones.find((value) => value > progress) || null;
+    return {
+      id: quest.id,
+      title: quest.title,
+      theme: quest.theme,
+      summary: quest.summary,
+      progress,
+      unlockedCount,
+      totalFragments: quest.fragments.length,
+      nextMilestone,
+      fragments: quest.fragments.slice(0, unlockedCount),
+    };
+  });
+}
+
+async function updateArcQuestProgress(delta) {
+  const progressMap = await ensureArcQuestProgress();
+  const unlocked = [];
+  for (const quest of ARC_QUESTS) {
+    const record = progressMap.get(quest.id);
+    if (!record) continue;
+    const prevUnlocked = record.unlockedCount;
+    const nextProgress = record.progress + delta;
+    const nextUnlocked = unlockedCountForQuest(quest, nextProgress);
+    if (isWeb) {
+      record.progress = nextProgress;
+      record.unlockedCount = nextUnlocked;
+      record.updatedAt = nowIso();
+    } else {
+      await execSql(
+        'UPDATE arc_quest_progress SET progress = ?, unlockedCount = ?, updatedAt = ? WHERE arcId = ?',
+        [nextProgress, nextUnlocked, nowIso(), quest.id]
+      );
+    }
+    if (nextUnlocked > prevUnlocked) {
+      unlocked.push({
+        arcId: quest.id,
+        title: quest.title,
+        fragment: quest.fragments[nextUnlocked - 1] || null,
+      });
+    }
+  }
+  return unlocked;
+}
+
 export async function logEffort({ habitId, note }) {
   const id = makeId('effort');
   const timestamp = nowIso();
@@ -780,23 +1146,26 @@ export async function logEffort({ habitId, note }) {
   }
 
   await updateIdentityTotals(resolvedEffort);
+  const arcUnlocks = await updateArcQuestProgress(resolvedEffort);
 
   const consistency = await getConsistencyScore();
   const chestId = makeId('chest');
   const baseRarity = rarityFromConsistency(consistency);
   const mercy = await applyMercyIfEligible(baseRarity, inactivityDays);
   const rarity = mercy.rarity;
+  const chestTier = chestTierFromConsistency(consistency);
   if (isWeb) {
     webStore.chests.push({
       id: chestId,
       rarity,
+      tier: chestTier,
       earnedAt: timestamp,
       unlockedRewardCount: 0,
     });
   } else {
     await execSql(
-      'INSERT INTO chests (id, rarity, earnedAt, unlockedRewardCount) VALUES (?, ?, ?, 0)',
-      [chestId, rarity, timestamp]
+      'INSERT INTO chests (id, rarity, tier, earnedAt, unlockedRewardCount) VALUES (?, ?, ?, ?, 0)',
+      [chestId, rarity, chestTier, timestamp]
     );
   }
   const chestTheme = deriveChestTheme(habitName);
@@ -816,7 +1185,7 @@ export async function logEffort({ habitId, note }) {
       [chestId, habitId, habitName || null, resolvedEffort, consistency, chestTheme, timestamp]
     );
   }
-  await createChestRewards(chestId, rarity, consistency);
+  await createChestRewards(chestId, rarity, consistency, chestTier);
   if (mercy.bypassUnlock) {
     if (isWeb) {
       const reward = webStore.chestRewards.find(
@@ -844,7 +1213,15 @@ export async function logEffort({ habitId, note }) {
   }
 
   if (isWeb) saveWebStore();
-  return { effortId: id, chestId, rarity, mercyUsed: mercy.mercyUsed, mercyBypass: mercy.bypassUnlock };
+  return {
+    effortId: id,
+    chestId,
+    rarity,
+    chestTier,
+    mercyUsed: mercy.mercyUsed,
+    mercyBypass: mercy.bypassUnlock,
+    arcUnlocks,
+  };
 }
 
 export async function listChests(limit = 5) {
@@ -856,9 +1233,12 @@ export async function listChests(limit = 5) {
       const rewards = webStore.chestRewards.filter((item) => item.chestId === chest.id);
       const locked = rewards.filter((item) => item.locked);
       const meta = webStore.chestMeta.find((item) => item.chestId === chest.id) || null;
+      const computedTier = chest.tier || chestTierFromConsistency(meta?.consistencyCount || 0);
       return {
         id: chest.id,
         rarity: chest.rarity,
+        tier: computedTier,
+        tierLabel: CHEST_TIER_LABELS[computedTier] || CHEST_TIER_LABELS.weathered,
         earnedAt: chest.earnedAt,
         unlockedRewardCount: chest.unlockedRewardCount,
         rewardCount: rewards.length,
@@ -870,6 +1250,7 @@ export async function listChests(limit = 5) {
   }
   const result = await execSql(
     `SELECT c.id, c.rarity, c.earnedAt, c.unlockedRewardCount,
+      c.tier as tier,
       (SELECT COUNT(*) FROM chest_rewards cr WHERE cr.chestId = c.id) as rewardCount,
       (SELECT COUNT(*) FROM chest_rewards cr WHERE cr.chestId = c.id AND cr.locked = 1) as lockedCount,
       m.theme as theme,
@@ -882,7 +1263,12 @@ export async function listChests(limit = 5) {
   );
   const items = [];
   for (let i = 0; i < result.rows.length; i += 1) {
-    items.push(result.rows.item(i));
+    const row = result.rows.item(i);
+    items.push({
+      ...row,
+      tier: row.tier || 'weathered',
+      tierLabel: CHEST_TIER_LABELS[row.tier] || CHEST_TIER_LABELS.weathered,
+    });
   }
   return items;
 }
@@ -891,7 +1277,9 @@ export async function listItems(limit = 20) {
   if (isWeb) {
     const items = webStore.items
       .map((item) => {
-        const reward = webStore.chestRewards.find((cr) => cr.itemId === item.id);
+        const reward = webStore.chestRewards.find(
+          (cr) => cr.rewardId === item.id || cr.itemId === item.id
+        );
         if (!reward) return null;
         const chest = webStore.chests.find((c) => c.id === reward.chestId);
         if (!chest) return null;
@@ -899,9 +1287,12 @@ export async function listItems(limit = 20) {
           id: item.id,
           type: item.type,
           modifiersJson: item.modifiersJson,
+          name: item.name,
+          effect: item.effect,
+          rarity: item.rarity || chest.rarity,
+          metaJson: item.metaJson,
           locked: reward.locked,
           chestId: reward.chestId,
-          rarity: chest.rarity,
           earnedAt: chest.earnedAt,
         };
       })
@@ -910,7 +1301,8 @@ export async function listItems(limit = 20) {
     return items.slice(0, limit);
   }
   const result = await execSql(
-    `SELECT i.id, i.type, i.modifiersJson, cr.locked, cr.chestId, c.rarity, c.earnedAt
+    `SELECT i.id, i.type, i.modifiersJson, i.name, i.effect, i.rarity, i.metaJson,
+      cr.locked, cr.chestId, c.rarity as chestRarity, c.earnedAt
      FROM items i
      JOIN chest_rewards cr ON cr.itemId = i.id
      JOIN chests c ON c.id = cr.chestId
@@ -920,9 +1312,73 @@ export async function listItems(limit = 20) {
   );
   const items = [];
   for (let i = 0; i < result.rows.length; i += 1) {
-    items.push(result.rows.item(i));
+    const row = result.rows.item(i);
+    items.push({
+      id: row.id,
+      type: row.type,
+      modifiersJson: row.modifiersJson,
+      name: row.name,
+      effect: row.effect,
+      rarity: row.rarity || row.chestRarity,
+      metaJson: row.metaJson,
+      locked: row.locked,
+      chestId: row.chestId,
+      earnedAt: row.earnedAt,
+    });
   }
   return items;
+}
+
+function cardInfoByKey(cardKey) {
+  return CARD_CATALOG.find((card) => card.key === cardKey) || null;
+}
+
+export async function listCards(limit = 20) {
+  if (isWeb) {
+    const cards = webStore.cards
+      .map((card) => {
+        const reward = webStore.chestRewards.find((cr) => cr.rewardId === card.id);
+        const chest = reward ? webStore.chests.find((c) => c.id === reward.chestId) : null;
+        const info = cardInfoByKey(card.cardKey);
+        return {
+          id: card.id,
+          cardKey: card.cardKey,
+          name: info?.name || card.cardKey,
+          effect: info?.effect || '',
+          rarity: card.rarity,
+          locked: reward ? reward.locked : false,
+          chestId: reward ? reward.chestId : card.chestId,
+          earnedAt: chest ? chest.earnedAt : card.createdAt,
+        };
+      })
+      .sort((a, b) => new Date(b.earnedAt) - new Date(a.earnedAt));
+    return cards.slice(0, limit);
+  }
+  const result = await execSql(
+    `SELECT c.id, c.cardKey, c.rarity, c.createdAt, c.chestId,
+      cr.locked, cr.chestId as rewardChestId
+     FROM cards c
+     LEFT JOIN chest_rewards cr ON cr.rewardId = c.id
+     ORDER BY c.createdAt DESC
+     LIMIT ?`,
+    [limit]
+  );
+  const cards = [];
+  for (let i = 0; i < result.rows.length; i += 1) {
+    const row = result.rows.item(i);
+    const info = cardInfoByKey(row.cardKey);
+    cards.push({
+      id: row.id,
+      cardKey: row.cardKey,
+      name: info?.name || row.cardKey,
+      effect: info?.effect || '',
+      rarity: row.rarity,
+      locked: row.locked ? true : false,
+      chestId: row.rewardChestId || row.chestId,
+      earnedAt: row.createdAt,
+    });
+  }
+  return cards;
 }
 
 export async function listRecentEfforts({ limit = 5, habitId = null } = {}) {
@@ -1034,7 +1490,11 @@ export async function createCombatEncounter(chestId) {
     const chest = webStore.chests.find((item) => item.id === chestId);
     if (!chest) return null;
     const difficultyTier =
-      chest.rarity === 'mythic' ? 'hard' : chest.rarity === 'rare' ? 'standard' : 'light';
+      chest.rarity === 'relic' || chest.rarity === 'epic'
+        ? 'hard'
+        : chest.rarity === 'rare'
+        ? 'standard'
+        : 'light';
     const id = makeId('combat');
     const createdAt = nowIso();
     webStore.combatEncounters.push({
@@ -1050,7 +1510,11 @@ export async function createCombatEncounter(chestId) {
   if (chestResult.rows.length === 0) return null;
   const chest = chestResult.rows.item(0);
   const difficultyTier =
-    chest.rarity === 'mythic' ? 'hard' : chest.rarity === 'rare' ? 'standard' : 'light';
+    chest.rarity === 'relic' || chest.rarity === 'epic'
+      ? 'hard'
+      : chest.rarity === 'rare'
+      ? 'standard'
+      : 'light';
   const id = makeId('combat');
   const createdAt = nowIso();
   await execSql(
@@ -1167,8 +1631,10 @@ export async function exportAllData() {
       effortLogs: [...webStore.effortLogs],
       chests: [...webStore.chests],
       items: [...webStore.items],
+      cards: [...webStore.cards],
       chestRewards: [...webStore.chestRewards],
       chestMeta: [...webStore.chestMeta],
+      arcQuestProgress: [...webStore.arcQuestProgress],
       combatEncounters: [...webStore.combatEncounters],
       mercyEvents: [...webStore.mercyEvents],
       habitEffortCache: Object.values(webStore.habitEffortCache),
@@ -1180,8 +1646,10 @@ export async function exportAllData() {
   const effortLogs = await fetchAllRows('SELECT * FROM effort_logs');
   const chests = await fetchAllRows('SELECT * FROM chests');
   const items = await fetchAllRows('SELECT * FROM items');
+  const cards = await fetchAllRows('SELECT * FROM cards');
   const chestRewards = await fetchAllRows('SELECT * FROM chest_rewards');
   const chestMeta = await fetchAllRows('SELECT * FROM chest_meta');
+  const arcQuestProgress = await fetchAllRows('SELECT * FROM arc_quest_progress');
   const combatEncounters = await fetchAllRows('SELECT * FROM combat_encounters');
   const mercyEvents = await fetchAllRows('SELECT * FROM mercy_events');
   const habitEffortCache = await fetchAllRows('SELECT * FROM habit_effort_cache');
@@ -1193,8 +1661,10 @@ export async function exportAllData() {
     effortLogs,
     chests,
     items,
+    cards,
     chestRewards,
     chestMeta,
+    arcQuestProgress,
     combatEncounters,
     mercyEvents,
     habitEffortCache,
@@ -1208,8 +1678,10 @@ export async function clearAllData() {
     webStore.effortLogs = [];
     webStore.chests = [];
     webStore.items = [];
+    webStore.cards = [];
     webStore.chestRewards = [];
     webStore.chestMeta = [];
+    webStore.arcQuestProgress = [];
     webStore.combatEncounters = [];
     webStore.mercyEvents = [];
     webStore.habitEffortCache = {};
@@ -1220,11 +1692,13 @@ export async function clearAllData() {
   await execSql('DELETE FROM chest_meta');
   await execSql('DELETE FROM combat_encounters');
   await execSql('DELETE FROM effort_logs');
+  await execSql('DELETE FROM cards');
   await execSql('DELETE FROM items');
   await execSql('DELETE FROM chests');
   await execSql('DELETE FROM habits');
   await execSql('DELETE FROM mercy_events');
   await execSql('DELETE FROM habit_effort_cache');
+  await execSql('DELETE FROM arc_quest_progress');
   await execSql('DELETE FROM identity');
 }
 
@@ -1237,8 +1711,12 @@ export async function importAllData(payload) {
     webStore.effortLogs = payload.effortLogs ? [...payload.effortLogs] : [];
     webStore.chests = payload.chests ? [...payload.chests] : [];
     webStore.items = payload.items ? [...payload.items] : [];
+    webStore.cards = payload.cards ? [...payload.cards] : [];
     webStore.chestRewards = payload.chestRewards ? [...payload.chestRewards] : [];
     webStore.chestMeta = payload.chestMeta ? [...payload.chestMeta] : [];
+    webStore.arcQuestProgress = payload.arcQuestProgress
+      ? [...payload.arcQuestProgress]
+      : [];
     webStore.combatEncounters = payload.combatEncounters
       ? [...payload.combatEncounters]
       : [];
@@ -1282,8 +1760,8 @@ export async function importAllData(payload) {
 
   for (const chest of payload.chests || []) {
     await execSql(
-      'INSERT INTO chests (id, rarity, earnedAt, unlockedRewardCount) VALUES (?, ?, ?, ?)',
-      [chest.id, chest.rarity, chest.earnedAt, chest.unlockedRewardCount || 0]
+      'INSERT INTO chests (id, rarity, tier, earnedAt, unlockedRewardCount) VALUES (?, ?, ?, ?, ?)',
+      [chest.id, chest.rarity, chest.tier || null, chest.earnedAt, chest.unlockedRewardCount || 0]
     );
   }
 
@@ -1304,15 +1782,45 @@ export async function importAllData(payload) {
 
   for (const item of payload.items || []) {
     await execSql(
-      'INSERT INTO items (id, type, modifiersJson, createdAt) VALUES (?, ?, ?, ?)',
-      [item.id, item.type, item.modifiersJson, item.createdAt]
+      'INSERT INTO items (id, type, modifiersJson, name, rarity, effect, metaJson, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [
+        item.id,
+        item.type,
+        item.modifiersJson,
+        item.name || null,
+        item.rarity || null,
+        item.effect || null,
+        item.metaJson || null,
+        item.createdAt,
+      ]
     );
   }
 
   for (const reward of payload.chestRewards || []) {
     await execSql(
-      'INSERT INTO chest_rewards (id, chestId, itemId, locked) VALUES (?, ?, ?, ?)',
-      [reward.id, reward.chestId, reward.itemId, reward.locked ? 1 : 0]
+      'INSERT INTO chest_rewards (id, chestId, itemId, rewardType, rewardId, locked) VALUES (?, ?, ?, ?, ?, ?)',
+      [
+        reward.id,
+        reward.chestId,
+        reward.itemId || null,
+        reward.rewardType || null,
+        reward.rewardId || null,
+        reward.locked ? 1 : 0,
+      ]
+    );
+  }
+
+  for (const card of payload.cards || []) {
+    await execSql(
+      'INSERT INTO cards (id, cardKey, rarity, createdAt, chestId) VALUES (?, ?, ?, ?, ?)',
+      [card.id, card.cardKey, card.rarity, card.createdAt, card.chestId || null]
+    );
+  }
+
+  for (const arc of payload.arcQuestProgress || []) {
+    await execSql(
+      'INSERT INTO arc_quest_progress (arcId, progress, unlockedCount, updatedAt) VALUES (?, ?, ?, ?)',
+      [arc.arcId, arc.progress, arc.unlockedCount || 0, arc.updatedAt || nowIso()]
     );
   }
 

@@ -38,6 +38,8 @@ import {
   listChests,
   listHabits,
   listItems,
+  listCards,
+  listArcQuestStatus,
   getEvidenceSummary,
   listRecentEfforts,
   exportAllData,
@@ -254,6 +256,7 @@ export default function StatusScreen() {
   const [newHabitName, setNewHabitName] = useState('');
   const [chests, setChests] = useState([]);
   const [items, setItems] = useState([]);
+  const [cards, setCards] = useState([]);
   const [efforts, setEfforts] = useState([]);
   const [effortFilter, setEffortFilter] = useState('all');
   const [effortInfo, setEffortInfo] = useState(null);
@@ -305,6 +308,9 @@ export default function StatusScreen() {
   const [backupHistory, setBackupHistory] = useState([]);
   const [adminLoading, setAdminLoading] = useState(false);
   const [adminLog, setAdminLog] = useState([]);
+  const [arcQuests, setArcQuests] = useState([]);
+  const [arcOverlay, setArcOverlay] = useState(null);
+  const [statusDropdownOpen, setStatusDropdownOpen] = useState(false);
   const [activeTab, setActiveTab] = useState('Tasks');
   const [rlsMessage, setRlsMessage] = useState('');
   const [backupPassphrase, setBackupPassphrase] = useState('');
@@ -329,6 +335,8 @@ export default function StatusScreen() {
     const habitList = await listHabits();
     const chestList = await listChests(5);
     const itemList = await listItems(20);
+    const cardList = await listCards(20);
+    const arcQuestList = await listArcQuestStatus();
     const effortList = await listRecentEfforts({
       limit: 6,
       habitId: effortFilter === 'all' ? null : effortFilter,
@@ -341,9 +349,11 @@ export default function StatusScreen() {
     setHabits(habitList);
     setChests(chestList);
     setItems(itemList);
+    setCards(cardList);
     setEfforts(effortList);
     setEvidence(evidenceSummary);
     setCombatChest(latestChest);
+    setArcQuests(arcQuestList);
     if (habitList.length > 0) {
       const effortEntries = await Promise.all(
         habitList.map(async (habit) => {
@@ -563,6 +573,7 @@ export default function StatusScreen() {
         efforts: 0,
         chests: 0,
         items: 0,
+        cards: 0,
         payloadBytes,
         encrypted: false,
         meta,
@@ -576,6 +587,7 @@ export default function StatusScreen() {
       efforts: payload.effortLogs?.length || 0,
       chests: payload.chests?.length || 0,
       items: payload.items?.length || 0,
+      cards: payload.cards?.length || 0,
       payloadBytes,
       encrypted: false,
       meta,
@@ -591,6 +603,7 @@ export default function StatusScreen() {
       efforts: payload?.effortLogs?.length || 0,
       chests: payload?.chests?.length || 0,
       items: payload?.items?.length || 0,
+      cards: payload?.cards?.length || 0,
       lastActiveAt: payload?.identity?.lastActiveAt || null,
       payloadBytes,
       deviceId: meta?.deviceId || null,
@@ -713,6 +726,9 @@ export default function StatusScreen() {
     });
     await refresh();
     setEffortNote('');
+    if (result?.arcUnlocks?.length) {
+      setArcOverlay(result.arcUnlocks[0]);
+    }
     if (authStatus === 'signed_in') {
       try {
         const payload = await exportAllData();
@@ -1633,6 +1649,7 @@ export default function StatusScreen() {
 
   const { identity, counts } = snapshot;
   const unlockedItems = items.filter((item) => !item.locked);
+  const unlockedCards = cards.filter((card) => !card.locked);
   const activeHabits = habits.filter((habit) => habit.isActive).length;
   const pausedHabits = habits.length - activeHabits;
   const showTasks = activeTab === 'Tasks';
@@ -1641,6 +1658,8 @@ export default function StatusScreen() {
   const showHelp = activeTab === 'Help';
   const showAdmin = activeTab === 'Admin';
   const showPlaceholder = ['Shops', 'Party', 'Group'].includes(activeTab);
+  const phase2Stats = computePhase2Stats();
+  const identityTitle = getIdentityTitle(identity?.level || 1);
 
   function getHabitTags(name) {
     const text = name.toLowerCase();
@@ -1674,7 +1693,43 @@ export default function StatusScreen() {
     return Array.from(tags);
   }
 
-  // Stats system is intentionally deferred to a later phase.
+  function getIdentityTitle(level) {
+    if (level >= 20) return 'Relic-Bound';
+    if (level >= 15) return 'Arckeeper';
+    if (level >= 10) return 'Anchor';
+    if (level >= 5) return 'Wayfarer';
+    return 'Initiate';
+  }
+
+  function clampValue(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function computePhase2Stats() {
+    const days = inactivityDays || 0;
+    const activeDays = evidence?.activeDays || 0;
+    const momentum =
+      days <= 1 ? 'Steady' : days <= 3 ? 'Warming' : days <= 7 ? 'Quiet' : 'Dormant';
+    const consistency =
+      activeDays >= 20 ? 'Anchored' : activeDays >= 10 ? 'Forming' : activeDays >= 4 ? 'Faint' : 'New';
+    const vitality = days <= 1 ? 'Ready' : days <= 3 ? 'Rested' : 'Recovering';
+    const hp = clampValue(100 - days * 4, 60, 100);
+    const mp = clampValue(85 - days * 3, 50, 90);
+    return { momentum, consistency, vitality, hp, mp };
+  }
+
+  function getItemDetails(item) {
+    if (!item?.modifiersJson) return { modifiers: [], tag: '' };
+    try {
+      const parsed = JSON.parse(item.modifiersJson);
+      return {
+        modifiers: Array.isArray(parsed?.modifiers) ? parsed.modifiers : [],
+        tag: parsed?.tag || '',
+      };
+    } catch (error) {
+      return { modifiers: [], tag: '' };
+    }
+  }
 
   const mainContent = (
     <>
@@ -1748,9 +1803,19 @@ export default function StatusScreen() {
               <Text style={styles.avatarText}>SIGIL</Text>
             </View>
             <View style={styles.heroStats}>
-              <Text style={styles.heroLabel}>Identity Level</Text>
-              <Text style={styles.heroValue}>{identity.level}</Text>
-              <Text style={styles.heroSubtle}>Total Effort: {identity.totalEffortUnits}</Text>
+              <Text style={styles.heroLabel}>Identity</Text>
+              <Text style={styles.heroValue}>Level {identity.level}</Text>
+              <Text style={styles.heroSubtle}>Title: {identityTitle}</Text>
+              <View style={styles.heroVitals}>
+                <View style={styles.heroVitalChip}>
+                  <Text style={styles.heroVitalLabel}>HP</Text>
+                  <Text style={styles.heroVitalValue}>{phase2Stats.hp}</Text>
+                </View>
+                <View style={styles.heroVitalChip}>
+                  <Text style={styles.heroVitalLabel}>MP</Text>
+                  <Text style={styles.heroVitalValue}>{phase2Stats.mp}</Text>
+                </View>
+              </View>
             </View>
           </View>
           <View style={styles.divider} />
@@ -1790,10 +1855,20 @@ export default function StatusScreen() {
 
       {showTasks ? (
         <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Core Stats</Text>
-          <Text style={styles.subtle}>
-            Phase 2: character stats + point system rewrite.
-          </Text>
+          <Text style={styles.panelTitle}>Today</Text>
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Momentum</Text>
+            <Text style={styles.statValue}>{phase2Stats.momentum}</Text>
+          </View>
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Consistency</Text>
+            <Text style={styles.statValue}>{phase2Stats.consistency}</Text>
+          </View>
+          <View style={styles.statRow}>
+            <Text style={styles.statLabel}>Vitality</Text>
+            <Text style={styles.statValue}>{phase2Stats.vitality}</Text>
+          </View>
+          <Text style={styles.subtle}>Soft stats only. No urgency, no pressure.</Text>
         </View>
       ) : null}
 
@@ -1820,6 +1895,40 @@ export default function StatusScreen() {
                 : 'No chest yet'}
             </Text>
           </View>
+        </View>
+      ) : null}
+
+      {showTasks ? (
+        <View style={styles.panel}>
+          <Text style={styles.panelTitle}>Arc Quests</Text>
+          {arcQuests.length === 0 ? (
+            <Text style={styles.subtle}>Arc quests appear quietly over time.</Text>
+          ) : (
+            <View style={styles.arcList}>
+              {arcQuests.map((quest) => (
+                <View key={quest.id} style={styles.arcCard}>
+                  <View style={styles.arcHeader}>
+                    <Text style={styles.arcTitle}>{quest.title}</Text>
+                    <Text style={styles.arcTheme}>{quest.theme}</Text>
+                  </View>
+                  <Text style={styles.subtle}>{quest.summary}</Text>
+                  <View style={styles.arcProgressRow}>
+                    <Text style={styles.arcProgressValue}>{quest.progress} effort</Text>
+                    <Text style={styles.arcProgressMeta}>
+                      {quest.unlockedCount}/{quest.totalFragments} fragments
+                    </Text>
+                  </View>
+                  {quest.nextMilestone ? (
+                    <Text style={styles.arcProgressMeta}>
+                      Next fragment at {quest.nextMilestone} effort
+                    </Text>
+                  ) : (
+                    <Text style={styles.arcProgressMeta}>All fragments unlocked.</Text>
+                  )}
+                </View>
+              ))}
+            </View>
+          )}
         </View>
       ) : null}
 
@@ -1938,6 +2047,7 @@ export default function StatusScreen() {
                   <Text style={styles.subtle}>Level {backupPreview.identityLevel}</Text>
                   <Text style={styles.subtle}>Effort {backupPreview.totalEffort}</Text>
                   <Text style={styles.subtle}>Habits {backupPreview.habits}</Text>
+                  <Text style={styles.subtle}>Cards {backupPreview.cards || 0}</Text>
                   <Text style={styles.subtle}>Chests {backupPreview.chests}</Text>
                   <Text style={styles.subtle}>Items {backupPreview.items}</Text>
                   <Pressable
@@ -2402,624 +2512,7 @@ export default function StatusScreen() {
           {adminMessage ? <Text style={styles.subtle}>{adminMessage}</Text> : null}
         </View>
       ) : null}
-{showTasks ? (
-        <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Status</Text>
-          <View style={styles.heroRow}>
-            <View style={styles.avatarBox}>
-              <Text style={styles.avatarText}>SIGIL</Text>
-            </View>
-            <View style={styles.heroStats}>
-              <Text style={styles.heroLabel}>Identity Level</Text>
-              <Text style={styles.heroValue}>{identity.level}</Text>
-              <Text style={styles.heroSubtle}>Total Effort: {identity.totalEffortUnits}</Text>
-            </View>
-          </View>
-          <View style={styles.divider} />
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Habits</Text>
-            <Text style={styles.statValue}>{counts.habits}</Text>
-          </View>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Efforts Logged</Text>
-            <Text style={styles.statValue}>{counts.efforts}</Text>
-          </View>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Chests Earned</Text>
-            <Text style={styles.statValue}>{counts.chests}</Text>
-          </View>
-          <Text style={styles.subtle}>
-            Re-entry mode: {isQuietMode ? 'quiet' : 'standard'}
-          </Text>
-          <Text style={styles.subtle}>
-            Active habits: {activeHabits} - Paused: {pausedHabits}
-          </Text>
-          {!EMAIL_AUTH_ENABLED ? (
-            <Text style={styles.subtle}>
-              Email sign-in disabled until a domain is configured.
-            </Text>
-          ) : null}
-          {mercyStatus?.eligible ? (
-            <Text style={styles.subtle}>Mercy active: slight chest boost on next effort.</Text>
-          ) : null}
-          {mercyStatus && !mercyStatus.eligible && mercyStatus.cooldownDaysRemaining > 0 ? (
-            <Text style={styles.subtle}>
-              Mercy recharges in {mercyStatus.cooldownDaysRemaining} days.
-            </Text>
-          ) : null}
-        </View>
-      ) : null}
-
       {showTasks ? (
-        <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Core Stats</Text>
-          <Text style={styles.subtle}>
-            Phase 2: character stats + point system rewrite.
-          </Text>
-        </View>
-      ) : null}
-
-      {showTasks && evidence ? (
-        <View style={[styles.panel, styles.panelTight]}>
-          <Text style={styles.panelTitle}>Evidence</Text>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Days Shown Up</Text>
-            <Text style={styles.statValue}>{evidence.activeDays}</Text>
-          </View>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Last Effort</Text>
-            <Text style={styles.statValue}>
-              {evidence.lastEffortAt
-                ? new Date(evidence.lastEffortAt).toLocaleDateString()
-                : 'No log yet'}
-            </Text>
-          </View>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Last Chest</Text>
-            <Text style={styles.statValue}>
-              {evidence.lastChestAt
-                ? new Date(evidence.lastChestAt).toLocaleDateString()
-                : 'No chest yet'}
-            </Text>
-          </View>
-        </View>
-      ) : null}
-
-      {showTasks && isQuietMode ? (
-        <View style={styles.panelQuiet}>
-          <Text style={styles.panelTitle}>Re-entry</Text>
-          <Text style={styles.quietText}>
-            No backlog. Start small and log a single effort when ready.
-          </Text>
-        </View>
-      ) : null}
-
-      {showHelp ? (
-        <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Account</Text>
-          <Text style={styles.subtle}>
-            {authStatus === 'signed_in'
-              ? `Mode: Linked (${authEmail || 'signed in'})`
-              : 'Mode: Guest (local-first)'}
-          </Text>
-          {adminStatus === 'signed_in' ? (
-            <Text style={styles.subtle}>Admin access enabled.</Text>
-          ) : null}
-          {authStatus === 'signed_in' ? (
-            <Text style={styles.subtle}>
-              Admin claim: {adminClaim === null ? 'Not present' : adminClaim ? 'true' : 'false'}
-            </Text>
-          ) : null}
-          <Text style={styles.subtle}>
-            Last backup: {lastBackupAt ? new Date(lastBackupAt).toLocaleString() : 'None'}
-          </Text>
-          {backupHistory.length > 0 ? (
-            <View style={styles.menuSection}>
-              <Text style={styles.menuLabel}>Backup History</Text>
-              {backupHistory.map((entry) => (
-                <Text key={entry.updatedAt} style={styles.subtle}>
-                  {new Date(entry.updatedAt).toLocaleString()}
-                  {entry.deviceId ? ` - ${entry.deviceId}` : ''}
-                  {entry.appVersion ? ` (v${entry.appVersion})` : ''}
-                </Text>
-              ))}
-              <Pressable
-                style={styles.buttonGhost}
-                onPress={handleClearBackupHistory}
-                disabled={adminBusy}
-              >
-                <Text style={styles.buttonGhostText}>Clear history</Text>
-              </Pressable>
-            </View>
-          ) : null}
-          <Pressable
-            style={styles.buttonGhost}
-            onPress={handleSaveBackup}
-            disabled={adminBusy}
-          >
-            <Text style={styles.buttonGhostText}>Save backup</Text>
-          </Pressable>
-          <Pressable
-            style={styles.buttonGhost}
-            onPress={handleLoadBackup}
-            disabled={adminBusy}
-          >
-            <Text style={styles.buttonGhostText}>Load backup to this device</Text>
-          </Pressable>
-          {Platform.OS === 'web' ? (
-            <View style={styles.menuSection}>
-              <Text style={styles.menuLabel}>Backup Encryption</Text>
-              <TextInput
-                value={backupPassphrase}
-                onChangeText={setBackupPassphrase}
-                placeholder="Passphrase (optional)"
-                placeholderTextColor="#4b5563"
-                style={styles.input}
-                secureTextEntry
-              />
-              <Text style={styles.subtle}>
-                {encryptionEnabled
-                  ? 'Encrypting backups on this device.'
-                  : 'Leave blank to save unencrypted backups.'}
-              </Text>
-            </View>
-          ) : (
-            <Text style={styles.subtle}>Backup encryption is available on web only.</Text>
-          )}
-          {backupPreview ? (
-            <View style={styles.menuSection}>
-              <Text style={styles.menuLabel}>Restore Preview</Text>
-              {backupConflict ? (
-                <Text style={styles.subtle}>
-                  Local activity is newer than this backup. Restoring will replace those changes.
-                </Text>
-              ) : null}
-              <Text style={styles.subtle}>Level {backupPreview.identityLevel}</Text>
-              <Text style={styles.subtle}>Effort {backupPreview.totalEffort}</Text>
-              <Text style={styles.subtle}>Habits {backupPreview.habits}</Text>
-              <Text style={styles.subtle}>Chests {backupPreview.chests}</Text>
-              <Text style={styles.subtle}>Items {backupPreview.items}</Text>
-              <Pressable
-                style={styles.button}
-                onPress={handleConfirmLoadBackup}
-                disabled={adminBusy}
-              >
-                <Text style={styles.buttonText}>
-                  {backupConflict ? 'Restore anyway' : 'Restore now'}
-                </Text>
-              </Pressable>
-              <Pressable
-                style={styles.buttonGhost}
-                onPress={handleCancelBackupPreview}
-                disabled={adminBusy}
-              >
-                <Text style={styles.buttonGhostText}>Cancel</Text>
-              </Pressable>
-            </View>
-          ) : null}
-          <View style={styles.menuSection}>
-            <Text style={styles.menuLabel}>Local Data</Text>
-            <Pressable style={styles.buttonGhost} onPress={handleExportLocalData}>
-              <Text style={styles.buttonGhostText}>Export local data</Text>
-            </Pressable>
-            <Pressable style={styles.buttonGhost} onPress={handleImportLocalData}>
-              <Text style={styles.buttonGhostText}>Import local data</Text>
-            </Pressable>
-            <Pressable style={styles.buttonGhost} onPress={handleResetLocalData}>
-              <Text style={styles.buttonGhostText}>Reset local data</Text>
-            </Pressable>
-          </View>
-          <View style={styles.menuSection}>
-            <Text style={styles.menuLabel}>Account & Onboarding</Text>
-            <Pressable style={styles.buttonGhost} onPress={handleShowOnboarding}>
-              <Text style={styles.buttonGhostText}>Show onboarding</Text>
-            </Pressable>
-          </View>
-          {accountMessage ? <Text style={styles.subtle}>{accountMessage}</Text> : null}
-        </View>
-      ) : null}
-{showAdmin ? (
-        <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Admin Dashboard</Text>
-          <Text style={styles.subtle}>
-            Server must enforce RLS. Client checks alone are not sufficient.
-          </Text>
-          <Text style={styles.subtle}>
-            Admin email list only gates UI visibility, not data access.
-          </Text>
-          {adminStatus === 'disabled' ? (
-            <Text style={styles.subtle}>Admin tools are disabled.</Text>
-          ) : null}
-          {adminStatus === 'signed_out' ? (
-            <Text style={styles.subtle}>Sign in via Help > Link account to access admin tools.</Text>
-          ) : null}
-          {adminStatus === 'signed_in' ? (
-            <>
-              <View style={styles.adminTabRow}>
-                {ADMIN_TABS.map((tab) => (
-                  <Pressable
-                    key={tab}
-                    style={[styles.adminTab, adminTab === tab && styles.adminTabActive]}
-                    onPress={() => setAdminTab(tab)}
-                  >
-                    <Text style={[styles.adminTabText, adminTab === tab && styles.adminTabTextActive]}>
-                      {tab}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
-
-              {adminTab === 'Overview' ? (
-                <View style={styles.adminGrid}>
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>Users</Text>
-                    <View style={styles.habitInputRow}>
-                      <TextInput
-                        value={adminUserSearch}
-                        onChangeText={setAdminUserSearch}
-                        placeholder="Search email"
-                        placeholderTextColor="#4b5563"
-                        style={styles.input}
-                        autoCapitalize="none"
-                      />
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={handleRefreshAdminOverview}
-                        disabled={adminLoading}
-                      >
-                        <Text style={styles.buttonText}>Load</Text>
-                      </Pressable>
-                    </View>
-                    <View style={styles.habitInputRow}>
-                      <TextInput
-                        value={adminUserIdSearch}
-                        onChangeText={setAdminUserIdSearch}
-                        placeholder="User id"
-                        placeholderTextColor="#4b5563"
-                        style={styles.input}
-                        autoCapitalize="none"
-                      />
-                    </View>
-                    <View style={styles.habitInputRow}>
-                      <TextInput
-                        value={adminDateFrom}
-                        onChangeText={setAdminDateFrom}
-                        placeholder="From (YYYY-MM-DD)"
-                        placeholderTextColor="#4b5563"
-                        style={styles.input}
-                        autoCapitalize="none"
-                      />
-                      <TextInput
-                        value={adminDateTo}
-                        onChangeText={setAdminDateTo}
-                        placeholder="To (YYYY-MM-DD)"
-                        placeholderTextColor="#4b5563"
-                        style={styles.input}
-                        autoCapitalize="none"
-                      />
-                    </View>
-                    {adminUsers.length === 0 ? (
-                      <Text style={styles.subtle}>No users loaded.</Text>
-                    ) : (
-                      adminUsers.map((user) => {
-                        const summary = adminSummaries.find(
-                          (item) => item.user_id === user.user_id
-                        );
-                        return (
-                          <View key={user.user_id} style={styles.adminRow}>
-                            <Text style={styles.adminRowTitle}>{user.email || user.user_id}</Text>
-                            <Text style={styles.subtle}>
-                              Last seen: {user.last_seen_at ? new Date(user.last_seen_at).toLocaleString() : '-'}
-                            </Text>
-                            {summary ? (
-                              <Text style={styles.subtle}>
-                                Effort {summary.total_effort || 0} - Habits {summary.habits || 0} -
-                                Chests {summary.chests || 0}
-                              </Text>
-                            ) : (
-                              <Text style={styles.subtle}>No summary yet.</Text>
-                            )}
-                          </View>
-                        );
-                      })
-                    )}
-                    <View style={styles.habitInputRow}>
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={() => {
-                          setAdminUserPage((prev) => Math.max(0, prev - 1));
-                          handleRefreshAdminOverview();
-                        }}
-                        disabled={adminLoading || adminUserPage === 0}
-                      >
-                        <Text style={styles.buttonText}>Prev</Text>
-                      </Pressable>
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={() => {
-                          setAdminUserPage((prev) => prev + 1);
-                          handleRefreshAdminOverview();
-                        }}
-                        disabled={adminLoading}
-                      >
-                        <Text style={styles.buttonText}>Next</Text>
-                      </Pressable>
-                    </View>
-                  </View>
-
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>System Health</Text>
-                    {adminEvents.length === 0 ? (
-                      <Text style={styles.subtle}>No events.</Text>
-                    ) : (
-                      adminEvents.map((event) => (
-                        <Text key={event.id} style={styles.subtle}>
-                          {new Date(event.created_at).toLocaleString()} - {event.type}
-                          {event.message ? ` - ${event.message}` : ''}
-                        </Text>
-                      ))
-                    )}
-                    <View style={styles.habitInputRow}>
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={() => {
-                          setAdminEventsPage((prev) => Math.max(0, prev - 1));
-                          handleRefreshAdminOverview();
-                        }}
-                        disabled={adminLoading || adminEventsPage === 0}
-                      >
-                        <Text style={styles.buttonText}>Prev</Text>
-                      </Pressable>
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={() => {
-                          setAdminEventsPage((prev) => prev + 1);
-                          handleRefreshAdminOverview();
-                        }}
-                        disabled={adminLoading}
-                      >
-                        <Text style={styles.buttonText}>Next</Text>
-                      </Pressable>
-                    </View>
-                  </View>
-
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>Admin Audit</Text>
-                    {adminAudit.length === 0 ? (
-                      <Text style={styles.subtle}>No admin actions logged.</Text>
-                    ) : (
-                      adminAudit.map((entry) => (
-                        <Text key={entry.id} style={styles.subtle}>
-                          {new Date(entry.created_at).toLocaleString()} - {entry.action}
-                          {entry.target_user_id ? ` - ${entry.target_user_id}` : ''}
-                        </Text>
-                      ))
-                    )}
-                    <View style={styles.habitInputRow}>
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={() => {
-                          setAdminAuditPage((prev) => Math.max(0, prev - 1));
-                          handleRefreshAdminOverview();
-                        }}
-                        disabled={adminLoading || adminAuditPage === 0}
-                      >
-                        <Text style={styles.buttonText}>Prev</Text>
-                      </Pressable>
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={() => {
-                          setAdminAuditPage((prev) => prev + 1);
-                          handleRefreshAdminOverview();
-                        }}
-                        disabled={adminLoading}
-                      >
-                        <Text style={styles.buttonText}>Next</Text>
-                      </Pressable>
-                    </View>
-                  </View>
-                </View>
-              ) : null}
-
-              {adminTab === 'Backups' ? (
-                <View style={styles.adminGrid}>
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>Backups</Text>
-                    <Pressable
-                      style={styles.buttonGhost}
-                      onPress={handleVerifyRls}
-                      disabled={adminLoading}
-                    >
-                      <Text style={styles.buttonGhostText}>Verify RLS</Text>
-                    </Pressable>
-                    {rlsMessage ? <Text style={styles.subtle}>{rlsMessage}</Text> : null}
-                    <View style={styles.habitInputRow}>
-                      <TextInput
-                        value={adminFilter}
-                        onChangeText={setAdminFilter}
-                        placeholder="Filter by user id"
-                        placeholderTextColor="#4b5563"
-                        style={styles.input}
-                        autoCapitalize="none"
-                      />
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={handleRefreshBackups}
-                        disabled={adminLoading}
-                      >
-                        <Text style={styles.buttonText}>Refresh</Text>
-                      </Pressable>
-                    </View>
-                    {adminBackups.length === 0 ? (
-                      <Text style={styles.subtle}>No backups loaded yet.</Text>
-                    ) : (
-                      adminBackups.map((backup) => (
-                        <Pressable
-                          key={backup.user_id}
-                          style={[
-                            styles.adminRow,
-                            adminSelectedUserId === backup.user_id && styles.adminRowSelected,
-                          ]}
-                          onPress={() => {
-                            setAdminSelectedUserId(backup.user_id);
-                            setAdminSummary(null);
-                            setAdminHistory([]);
-                          }}
-                        >
-                          <View>
-                            <Text style={styles.adminRowTitle}>{backup.user_id}</Text>
-                            <Text style={styles.subtle}>
-                              Updated {new Date(backup.updated_at).toLocaleString()}
-                            </Text>
-                          </View>
-                        </Pressable>
-                      ))
-                    )}
-                  </View>
-
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>Selected User</Text>
-                    {adminSelectedUserId ? (
-                      <>
-                        <Text style={styles.subtle}>{adminSelectedUserId}</Text>
-                        <Pressable
-                          style={styles.button}
-                          onPress={handlePreviewBackup}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonText}>Preview summary</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={handleLoadBackupHistoryForUser}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Load history</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={() => handleDeleteUserData('backup')}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Delete latest backup</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={() => handleDeleteUserData('history')}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Delete backup history</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={() => handleDeleteUserData('summary')}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Delete summary</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={() => handleDeleteUserData('events')}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Delete system events</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={() => handleDeleteUserData('profile')}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Delete profile</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={handleDeleteAllUserData}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Delete ALL user data</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={handleExportBackup}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Export JSON</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={handleLoadBackupForUser}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Load to this device</Text>
-                        </Pressable>
-                      </>
-                    ) : (
-                      <Text style={styles.subtle}>Select a user to manage.</Text>
-                    )}
-                  </View>
-
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>History</Text>
-                    {adminHistory.length > 0 ? (
-                      adminHistory.map((entry) => (
-                        <View key={entry.id || entry.updatedAt} style={styles.menuSection}>
-                          <Text style={styles.subtle}>
-                            {new Date(entry.updatedAt).toLocaleString()}
-                            {entry.deviceId ? ` - ${entry.deviceId}` : ''}
-                            {entry.appVersion ? ` (v${entry.appVersion})` : ''}
-                          </Text>
-                          <View style={styles.habitInputRow}>
-                            <Pressable
-                              style={styles.buttonSmall}
-                              onPress={() => handleRestoreHistoryEntry(entry)}
-                              disabled={adminLoading}
-                            >
-                              <Text style={styles.buttonText}>Restore</Text>
-                            </Pressable>
-                            <Pressable
-                              style={styles.buttonSmall}
-                              onPress={() => handleExportHistoryEntry(entry)}
-                              disabled={adminLoading}
-                            >
-                              <Text style={styles.buttonText}>Export</Text>
-                            </Pressable>
-                          </View>
-                        </View>
-                      ))
-                    ) : (
-                      <Text style={styles.subtle}>No history loaded.</Text>
-                    )}
-                  </View>
-                </View>
-              ) : null}
-
-              {adminTab === 'Logs' ? (
-                <View style={styles.adminGrid}>
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>Recent Actions</Text>
-                    {adminLog.length > 0 ? (
-                      adminLog.map((entry, index) => (
-                        <Text key={`${entry.at}-${index}`} style={styles.subtle}>
-                          {new Date(entry.at).toLocaleString()} - {entry.label}
-                        </Text>
-                      ))
-                    ) : (
-                      <Text style={styles.subtle}>No recent actions.</Text>
-                    )}
-                  </View>
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>Admin Message</Text>
-                    <Text style={styles.subtle}>{adminMessage || 'No messages.'}</Text>
-                  </View>
-                </View>
-              ) : null}
-            </>
-          ) : null}
-          {adminMessage ? <Text style={styles.subtle}>{adminMessage}</Text> : null}
-        </View>
-      ) : null}
-
-                    {showTasks ? (
         <View style={[styles.panel, styles.panelTight]}>
           <Text style={styles.panelTitle}>Habits</Text>
           {habits.length === 0 ? (
@@ -3113,7 +2606,10 @@ export default function StatusScreen() {
             <View style={styles.grid}>
               {chests.map((chest) => (
                 <View key={chest.id} style={styles.gridCard}>
-                  <Text style={styles.rarityTitle}>{chest.rarity.toUpperCase()}</Text>
+                  <Text style={styles.rarityTitle}>
+                    {(chest.tierLabel || chest.tier || 'Weathered').toString().toUpperCase()}
+                  </Text>
+                  <Text style={styles.gridSubtle}>Potential: {chest.rarity}</Text>
                   {chest.theme ? (
                     <Text style={styles.gridSubtle}>Theme: {chest.theme}</Text>
                   ) : null}
@@ -3197,21 +2693,48 @@ export default function StatusScreen() {
           <View style={styles.menuDivider} />
           <View style={styles.menuSection}>
             <Text style={styles.menuLabel}>Inventory</Text>
-            {unlockedItems.length === 0 ? (
+            {unlockedItems.length === 0 && unlockedCards.length === 0 ? (
               <Text style={styles.subtle}>Rewards remain locked until combat unlocks them.</Text>
             ) : (
-              <View style={styles.grid}>
-                {unlockedItems.map((item) => {
-                  const details = JSON.parse(item.modifiersJson);
-                  return (
-                    <View key={item.id} style={styles.gridCard}>
-                      <Text style={styles.gridTitle}>{item.type}</Text>
-                      <Text style={styles.gridSubtle}>{details.tag}</Text>
-                      <Text style={styles.gridSubtle}>{details.modifiers.join(' ')}</Text>
+              <>
+                {unlockedItems.length > 0 ? (
+                  <>
+                    <Text style={styles.menuHint}>Items</Text>
+                    <View style={styles.grid}>
+                      {unlockedItems.map((item) => {
+                        const details = getItemDetails(item);
+                        return (
+                          <View key={item.id} style={styles.gridCard}>
+                            <Text style={styles.gridTitle}>{item.name || item.type}</Text>
+                            <Text style={styles.gridSubtle}>{item.rarity || 'common'}</Text>
+                            {item.effect ? (
+                              <Text style={styles.gridSubtle}>{item.effect}</Text>
+                            ) : (
+                              <Text style={styles.gridSubtle}>
+                                {details.tag} {details.modifiers?.join(' ')}
+                              </Text>
+                            )}
+                          </View>
+                        );
+                      })}
                     </View>
-                  );
-                })}
-              </View>
+                  </>
+                ) : null}
+                {unlockedCards.length > 0 ? (
+                  <>
+                    <Text style={styles.menuHint}>Cards</Text>
+                    <View style={styles.grid}>
+                      {unlockedCards.map((card) => (
+                        <View key={card.id} style={styles.gridCard}>
+                          <Text style={styles.gridTitle}>{card.name}</Text>
+                          <Text style={styles.gridSubtle}>{card.rarity}</Text>
+                          <Text style={styles.gridSubtle}>{card.effect}</Text>
+                        </View>
+                      ))}
+                    </View>
+                  </>
+                ) : null}
+              </>
             )}
           </View>
         </View>
@@ -3242,6 +2765,20 @@ export default function StatusScreen() {
         style={styles.backgroundLogo}
         accessibilityIgnoresInvertColors
       />
+      {arcOverlay ? (
+        <View style={styles.arcOverlay}>
+          <View style={styles.arcOverlayCard}>
+            <Text style={styles.arcOverlayTitle}>Arc Fragment Unlocked</Text>
+            <Text style={styles.arcOverlayName}>{arcOverlay.title}</Text>
+            {arcOverlay.fragment ? (
+              <Text style={styles.arcOverlayFragment}>{arcOverlay.fragment}</Text>
+            ) : null}
+            <Pressable style={styles.button} onPress={() => setArcOverlay(null)}>
+              <Text style={styles.buttonText}>Dismiss</Text>
+            </Pressable>
+          </View>
+        </View>
+      ) : null}
       {showOnboarding ? (
         <View style={styles.onboardingOverlay}>
           <View
@@ -3417,14 +2954,55 @@ export default function StatusScreen() {
       <View style={styles.layout}>
         <View style={styles.sidePanel}>
           <Text style={styles.panelTitle}>Status Log</Text>
+          <Pressable
+            style={styles.statusDropdown}
+            onPress={() => setStatusDropdownOpen((prev) => !prev)}
+          >
+            <Text style={styles.statusDropdownLabel}>Today</Text>
+            <Text style={styles.statusDropdownValue}>
+              {statusDropdownOpen ? 'Hide' : 'Show'}
+            </Text>
+          </Pressable>
+          {statusDropdownOpen ? (
+            <View style={styles.statusDropdownList}>
+              <Text style={styles.sideLabel}>Habits</Text>
+              {habits.filter((habit) => habit.isActive).length === 0 ? (
+                <Text style={styles.sideMeta}>No active habits yet.</Text>
+              ) : (
+                habits
+                  .filter((habit) => habit.isActive)
+                  .map((habit) => (
+                    <Text key={habit.id} style={styles.sideMeta}>
+                      - {habit.name}
+                    </Text>
+                  ))
+              )}
+              <Text style={styles.sideLabel}>Arc Quests</Text>
+              {arcQuests.length === 0 ? (
+                <Text style={styles.sideMeta}>Quiet for now.</Text>
+              ) : (
+                arcQuests.map((quest) => (
+                  <Text key={quest.id} style={styles.sideMeta}>
+                    - {quest.title} ({quest.unlockedCount}/{quest.totalFragments})
+                  </Text>
+                ))
+              )}
+            </View>
+          ) : null}
           <View style={styles.sideBlock}>
-            <Text style={styles.sideLabel}>Evidence</Text>
-            <Text style={styles.sideValue}>
-              {identity ? `Level ${identity.level}` : 'Level 1'}
-            </Text>
-            <Text style={styles.sideMeta}>
-              {identity ? `${identity.totalEffortUnits} total effort` : '0 total effort'}
-            </Text>
+            <Text style={styles.sideLabel}>Identity</Text>
+            <Text style={styles.sideValue}>Level {identity?.level || 1}</Text>
+            <Text style={styles.sideMeta}>Title: {identityTitle}</Text>
+            <View style={styles.sideVitalsRow}>
+              <Text style={styles.sideMeta}>HP {phase2Stats.hp}</Text>
+              <Text style={styles.sideMeta}>MP {phase2Stats.mp}</Text>
+            </View>
+          </View>
+          <View style={styles.sideBlock}>
+            <Text style={styles.sideLabel}>Today</Text>
+            <Text style={styles.sideValue}>{phase2Stats.momentum}</Text>
+            <Text style={styles.sideMeta}>Consistency: {phase2Stats.consistency}</Text>
+            <Text style={styles.sideMeta}>Vitality: {phase2Stats.vitality}</Text>
           </View>
           <View style={styles.sideBlock}>
             <Text style={styles.sideLabel}>Re-entry</Text>
@@ -3615,6 +3193,114 @@ const styles = StyleSheet.create({
   sideMeta: {
     color: '#9bb3d6',
     fontSize: FONT.sm,
+  },
+  sideVitalsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 6,
+  },
+  statusDropdown: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#2b4e82',
+    backgroundColor: '#0f1d3b',
+    marginBottom: 12,
+  },
+  statusDropdownLabel: {
+    color: '#8bd6ff',
+    fontSize: FONT.sm,
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+  },
+  statusDropdownValue: {
+    color: '#e9f4ff',
+    fontSize: FONT.sm,
+  },
+  statusDropdownList: {
+    borderWidth: 1,
+    borderColor: '#2b4e82',
+    borderRadius: 10,
+    padding: 10,
+    backgroundColor: '#0b162e',
+    marginBottom: 12,
+  },
+  arcList: {
+    gap: 12,
+  },
+  arcCard: {
+    borderWidth: 1,
+    borderColor: '#2b4e82',
+    borderRadius: 12,
+    padding: 12,
+    backgroundColor: '#0b162e',
+  },
+  arcHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  arcTitle: {
+    color: '#eaf4ff',
+    fontSize: FONT.lg,
+    fontWeight: '700',
+  },
+  arcTheme: {
+    color: '#8bd6ff',
+    fontSize: FONT.sm,
+  },
+  arcProgressRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 8,
+  },
+  arcProgressValue: {
+    color: '#cfeaff',
+    fontSize: FONT.sm,
+  },
+  arcProgressMeta: {
+    color: '#9bb3d6',
+    fontSize: FONT.sm,
+  },
+  arcOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(4, 8, 18, 0.78)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 50,
+  },
+  arcOverlayCard: {
+    width: 320,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#6fd0ff',
+    backgroundColor: '#0c1732',
+    padding: 20,
+    gap: 10,
+  },
+  arcOverlayTitle: {
+    color: '#8bd6ff',
+    fontSize: FONT.xs,
+    letterSpacing: 1.4,
+    textTransform: 'uppercase',
+  },
+  arcOverlayName: {
+    color: ACCENT_GOLD,
+    fontSize: FONT.xl,
+    fontWeight: '700',
+  },
+  arcOverlayFragment: {
+    color: '#eaf4ff',
+    fontSize: FONT.sm,
+    lineHeight: 20,
   },
   centerPanel: {
     flex: 1,
@@ -3993,6 +3679,30 @@ const styles = StyleSheet.create({
     color: '#9bb3d6',
     fontSize: FONT.sm,
     marginTop: 2,
+  },
+  heroVitals: {
+    flexDirection: 'row',
+    marginTop: 10,
+  },
+  heroVitalChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+    backgroundColor: '#12264a',
+    marginRight: 8,
+  },
+  heroVitalLabel: {
+    color: '#9bb3d6',
+    fontSize: FONT.xs,
+    marginRight: 6,
+    letterSpacing: 0.5,
+  },
+  heroVitalValue: {
+    color: '#eaf4ff',
+    fontWeight: '700',
+    fontSize: FONT.sm,
   },
   divider: {
     height: 1,
