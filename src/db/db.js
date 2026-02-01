@@ -41,7 +41,10 @@ function loadWebStore() {
     webStore.identity = storedIdentity
       ? { ...storedIdentity, equippedCardId: storedIdentity.equippedCardId || null }
       : null;
-    webStore.habits = Array.isArray(data.habits) ? data.habits : [];
+    webStore.habits = (Array.isArray(data.habits) ? data.habits : []).map((habit) => ({
+      ...habit,
+      type: habit?.type || 'generic',
+    }));
     webStore.effortLogs = Array.isArray(data.effortLogs) ? data.effortLogs : [];
     webStore.chests = Array.isArray(data.chests) ? data.chests : [];
     webStore.items = Array.isArray(data.items) ? data.items : [];
@@ -189,40 +192,43 @@ const ARC_QUESTS = [
     id: 'arc_echoes',
     title: 'Show Up Again',
     theme: 'Identity',
-    summary: 'This arc tracks your general effort and reminds you that returning counts.',
-    milestones: [15, 35, 70, 120],
+    summary: 'Every effort counts. This arc honors the simple act of returning.',
+    milestones: [10, 25, 50, 100],
     fragments: [
-      'You logged effort again after a break.',
-      'You have shown up on multiple days.',
-      'Your effort is becoming a pattern you can trust.',
-      'You have built a stable rhythm over time.',
+      'You logged effort after the last log.',
+      'You showed up on several days.',
+      'Your rhythm is becoming reliable.',
+      'You trust the system because you keep showing up.',
     ],
+    scope: { type: 'any', value: null },
   },
   {
-    id: 'arc_stillwater',
-    title: 'Keep the Thread',
-    theme: 'Consistency',
-    summary: 'This arc advances whenever you log effort, no deadlines, no streaks.',
-    milestones: [10, 28, 60, 100],
+    id: 'arc_forge_the_base',
+    title: 'Forge the Base',
+    theme: 'Foundation',
+    summary: 'Built for gym-style efforts, this arc honors repeated training habits.',
+    milestones: [5, 15, 30, 60],
     fragments: [
-      'You logged effort on multiple days.',
-      'You are building a baseline of consistency.',
-      'You returned after gaps without losing progress.',
-      'Your consistency is now a long-term habit.',
+      'You completed a dedicated gym session.',
+      'Two weeks of intentional movement are stacking.',
+      'Your base is forming; rest counts too.',
+      'Strength emerges from consistency, not pressure.',
     ],
+    scope: { type: 'habitType', value: 'gym' },
   },
   {
-    id: 'arc_vigil',
-    title: 'Care for Energy',
+    id: 'arc_hydration_discipline',
+    title: 'Hydration Discipline',
     theme: 'Vitality',
-    summary: 'This arc reflects effort and recovery without pressure.',
-    milestones: [20, 45, 85, 130],
+    summary: 'Tracks steady hydration actions without shame or counting.',
+    milestones: [4, 12, 25, 50],
     fragments: [
-      'You kept going without forcing a streak.',
-      'You made progress even when energy was low.',
-      'You returned after rest and kept moving.',
-      'You have built a steady relationship with effort.',
+      'You logged hydration for the day.',
+      'Multiple days of water awareness are adding up.',
+      'The rhythm of cups is steadyening.',
+      'You honor your body with calm hydration.',
     ],
+    scope: { type: 'habitType', value: 'water' },
   },
 ];
 
@@ -515,7 +521,8 @@ export async function initDb() {
       id TEXT PRIMARY KEY NOT NULL,
       name TEXT NOT NULL,
       isActive INTEGER NOT NULL,
-      createdAt TEXT NOT NULL
+      createdAt TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT 'generic'
     )`
   );
 
@@ -525,6 +532,9 @@ export async function initDb() {
       habitId TEXT NOT NULL,
       effortValue INTEGER NOT NULL,
       note TEXT,
+      actionType TEXT NOT NULL DEFAULT 'custom',
+      units INTEGER NOT NULL DEFAULT 1,
+      metaJson TEXT,
       timestamp TEXT NOT NULL,
       createdAt TEXT NOT NULL,
       FOREIGN KEY (habitId) REFERENCES habits (id)
@@ -631,6 +641,10 @@ export async function initDb() {
     )`
   );
 
+  await ensureColumn('habits', 'type', "TEXT NOT NULL DEFAULT 'generic'");
+  await ensureColumn('effort_logs', 'actionType', "TEXT NOT NULL DEFAULT 'custom'");
+  await ensureColumn('effort_logs', 'units', 'INTEGER NOT NULL DEFAULT 1');
+  await ensureColumn('effort_logs', 'metaJson', 'TEXT');
   await ensureColumn('chests', 'tier', 'TEXT');
   await ensureColumn('items', 'name', 'TEXT');
   await ensureColumn('items', 'rarity', 'TEXT');
@@ -1048,6 +1062,18 @@ async function getHabitNameById(habitId) {
   return result.rows.item(0).name || '';
 }
 
+export async function getHabitById(habitId) {
+  if (!habitId) return null;
+  if (isWeb) {
+    return webStore.habits.find((item) => item.id === habitId) || null;
+  }
+  const result = await execSql(
+    'SELECT id, name, isActive, createdAt, type FROM habits WHERE id = ? LIMIT 1',
+    [habitId]
+  );
+  return result.rows.length ? result.rows.item(0) : null;
+}
+
 async function resolveEffortValue(habitId, fallbackName) {
   const habitName = fallbackName || (await getHabitNameById(habitId));
   if (!habitName) return 5;
@@ -1055,11 +1081,11 @@ async function resolveEffortValue(habitId, fallbackName) {
   return info?.effort || 5;
 }
 
-export async function createHabit(name) {
+export async function createHabit(name, type = 'generic') {
   if (isWeb) {
     const id = makeId('habit');
     const createdAt = nowIso();
-    const habit = { id, name, isActive: true, createdAt };
+    const habit = { id, name, isActive: true, createdAt, type: type || 'generic' };
     webStore.habits.push(habit);
     saveWebStore();
     return habit;
@@ -1067,8 +1093,8 @@ export async function createHabit(name) {
   const id = makeId('habit');
   const createdAt = nowIso();
   await execSql(
-    'INSERT INTO habits (id, name, isActive, createdAt) VALUES (?, ?, ?, ?)',
-    [id, name, 1, createdAt]
+    'INSERT INTO habits (id, name, isActive, createdAt, type) VALUES (?, ?, ?, ?, ?)',
+    [id, name, 1, createdAt, type || 'generic']
   );
   const created = await execSql('SELECT * FROM habits WHERE id = ?', [id]);
   return created.rows.item(0);
@@ -1415,22 +1441,45 @@ export async function listArcQuestStatus() {
         accepted: record ? Boolean(record.accepted) : false,
         ignored: record ? Boolean(record.ignored) : false,
         habitId: record ? record.habitId || null : null,
+        scope: quest.scope || { type: 'any', value: null },
         progress,
         unlockedCount,
         totalFragments: quest.fragments.length,
-      nextMilestone,
-      fragments: quest.fragments.slice(0, unlockedCount),
-    };
-  });
+        nextMilestone,
+        fragments: quest.fragments.slice(0, unlockedCount),
+      };
+    });
+  }
+
+function shouldQuestProgress(scope, habitId, habitType) {
+  const scopeType = scope?.type || 'any';
+  const scopeValue = scope?.value || null;
+  switch (scopeType) {
+    case 'any':
+      return true;
+    case 'habitType':
+      return (
+        habitType &&
+        scopeValue &&
+        habitType.toLowerCase() === scopeValue.toString().toLowerCase()
+      );
+    case 'habitId':
+      return habitId && scopeValue && habitId === scopeValue;
+    default:
+      return true;
+  }
 }
 
-async function updateArcQuestProgress(delta, habitId = null) {
+async function updateArcQuestProgress(delta, { habitId = null, habitType = 'generic' } = {}) {
   const progressMap = await ensureArcQuestProgress();
   const unlocked = [];
   for (const quest of ARC_QUESTS) {
     const record = progressMap.get(quest.id);
     if (!record) continue;
     if (record.ignored) {
+      continue;
+    }
+    if (!shouldQuestProgress(quest.scope, habitId, habitType)) {
       continue;
     }
     const boundHabitId = record.habitId || null;
@@ -1508,12 +1557,23 @@ export async function bindArcQuestToHabit(arcId, habitId) {
   await updateArcQuestRecord(arcId, { habitId, accepted: true });
 }
 
-export async function logEffort({ habitId, note }) {
+export async function logEffort({
+  habitId,
+  note,
+  actionType = 'custom',
+  units = 1,
+  meta = null,
+}) {
+  if (!habitId) {
+    throw new Error('Habit id required.');
+  }
   const id = makeId('effort');
   const timestamp = nowIso();
   const inactivityDays = await getInactivityDays();
   const resolvedEffort = await resolveEffortValue(habitId);
-  const habitName = await getHabitNameById(habitId);
+  const habitRecord = await getHabitById(habitId);
+  const habitName = habitRecord?.name || '';
+  const habitType = habitRecord?.type || 'generic';
 
   if (isWeb) {
     webStore.effortLogs.push({
@@ -1521,18 +1581,31 @@ export async function logEffort({ habitId, note }) {
       habitId,
       effortValue: resolvedEffort,
       note: note || null,
+      actionType,
+      units,
+      metaJson: meta ? JSON.stringify(meta) : null,
       timestamp,
       createdAt: timestamp,
     });
   } else {
     await execSql(
-      'INSERT INTO effort_logs (id, habitId, effortValue, note, timestamp, createdAt) VALUES (?, ?, ?, ?, ?, ?)',
-      [id, habitId, resolvedEffort, note || null, timestamp, timestamp]
+      'INSERT INTO effort_logs (id, habitId, effortValue, note, actionType, units, metaJson, timestamp, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [
+        id,
+        habitId,
+        resolvedEffort,
+        note || null,
+        actionType,
+        units,
+        meta ? JSON.stringify(meta) : null,
+        timestamp,
+        timestamp,
+      ]
     );
   }
 
   await updateIdentityTotals(resolvedEffort);
-    const arcUnlocks = await updateArcQuestProgress(resolvedEffort, habitId);
+  const arcUnlocks = await updateArcQuestProgress(resolvedEffort, { habitId, habitType });
 
   const consistency = await getConsistencyScore();
   const chestId = makeId('chest');
@@ -1607,7 +1680,36 @@ export async function logEffort({ habitId, note }) {
     mercyUsed: mercy.mercyUsed,
     mercyBypass: mercy.bypassUnlock,
     arcUnlocks,
+    actionType,
+    units,
+    meta,
   };
+}
+
+export async function countHabitActionsToday({ habitId, actionType, date = null }) {
+  if (!habitId || !actionType) return 0;
+  const targetDate = date ? new Date(date) : new Date();
+  const startOfDay = new Date(targetDate);
+  startOfDay.setHours(0, 0, 0, 0);
+  const endOfDay = new Date(targetDate);
+  endOfDay.setHours(23, 59, 59, 999);
+  if (isWeb) {
+    return webStore.effortLogs.reduce((sum, log) => {
+      if (log.habitId !== habitId) return sum;
+      if ((log.actionType || 'custom') !== actionType) return sum;
+      const timestamp = new Date(log.timestamp);
+      if (timestamp >= startOfDay && timestamp <= endOfDay) {
+        return sum + (typeof log.units === 'number' ? log.units : 1);
+      }
+      return sum;
+    }, 0);
+  }
+  const result = await execSql(
+    'SELECT SUM(units) as total FROM effort_logs WHERE habitId = ? AND actionType = ? AND timestamp >= ? AND timestamp <= ?',
+    [habitId, actionType, startOfDay.toISOString(), endOfDay.toISOString()]
+  );
+  if (result.rows.length === 0) return 0;
+  return result.rows.item(0).total || 0;
 }
 
 export async function listChests(limit = 5) {
@@ -1798,12 +1900,23 @@ export async function listRecentEfforts({ limit = 5, habitId = null } = {}) {
     );
     return sorted.slice(0, limit).map((item) => {
       const habit = webStore.habits.find((h) => h.id === item.habitId);
+      let metaValue = null;
+      if (item.metaJson) {
+        try {
+          metaValue = JSON.parse(item.metaJson);
+        } catch {
+          metaValue = null;
+        }
+      }
       return {
         id: item.id,
         effortValue: item.effortValue,
         note: item.note,
         timestamp: item.timestamp,
         habitName: habit ? habit.name : 'Unknown',
+        actionType: item.actionType || 'custom',
+        units: typeof item.units === 'number' ? item.units : 1,
+        meta: metaValue,
       };
     });
   }
@@ -1811,6 +1924,7 @@ export async function listRecentEfforts({ limit = 5, habitId = null } = {}) {
   const params = habitId ? [habitId, limit] : [limit];
   const result = await execSql(
     `SELECT e.id, e.effortValue, e.note, e.timestamp, h.name as habitName
+     , e.actionType, e.units, e.metaJson
      FROM effort_logs e
      JOIN habits h ON h.id = e.habitId
      ${whereClause}
@@ -1820,7 +1934,21 @@ export async function listRecentEfforts({ limit = 5, habitId = null } = {}) {
   );
   const items = [];
   for (let i = 0; i < result.rows.length; i += 1) {
-    items.push(result.rows.item(i));
+    const row = result.rows.item(i);
+    let parsedMeta = null;
+    if (row.metaJson) {
+      try {
+        parsedMeta = JSON.parse(row.metaJson);
+      } catch {
+        parsedMeta = null;
+      }
+    }
+    items.push({
+      ...row,
+      actionType: row.actionType || 'custom',
+      units: typeof row.units === 'number' ? row.units : 1,
+      meta: parsedMeta,
+    });
   }
   return items;
 }

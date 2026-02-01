@@ -42,6 +42,7 @@ import {
   listArcQuestStatus,
   getEvidenceSummary,
   listRecentEfforts,
+  countHabitActionsToday,
   exportAllData,
   importAllData,
   touchLastActive,
@@ -273,6 +274,7 @@ export default function StatusScreen() {
   const [effortInfo, setEffortInfo] = useState(null);
   const [effortNote, setEffortNote] = useState('');
   const [habitEfforts, setHabitEfforts] = useState({});
+  const [habitActionCounts, setHabitActionCounts] = useState({});
   const [evidence, setEvidence] = useState(null);
   const [combatChest, setCombatChest] = useState(null);
   const [combatMessage, setCombatMessage] = useState('');
@@ -342,6 +344,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   const [adminToolCardQuantity, setAdminToolCardQuantity] = useState('1');
   const [adminToolNotice, setAdminToolNotice] = useState('');
   const [equippedCardId, setEquippedCardId] = useState(null);
+  const [selectedChallengeHabitId, setSelectedChallengeHabitId] = useState(null);
 
   const TASK_SECTIONS = [
     { key: 'status', label: 'STATUS' },
@@ -397,26 +400,26 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     const mercy = await getMercyStatus(days);
     const habitList = await listHabits();
     const chestList = await listChests(5);
-    const itemList = await listItems(20);
-    const cardList = await listCards(20);
-    const effortList = await listRecentEfforts({
-      limit: 6,
-      habitId: effortFilter === 'all' ? null : effortFilter,
-    });
-    const evidenceSummary = await getEvidenceSummary();
-    const latestChest = await getLatestLockedChest();
-    setSnapshot(snap);
-    setInactivityDays(days);
-    setMercyStatus(mercy);
-    setHabits(habitList);
-    setChests(chestList);
-    setItems(itemList);
-    setCards(cardList);
-    setEfforts(effortList);
-    setEvidence(evidenceSummary);
-    setCombatChest(latestChest);
-    const currentEquipped = await getEquippedCardId();
-    setEquippedCardId(currentEquipped);
+      const itemList = await listItems(20);
+      const cardList = await listCards(20);
+      const effortList = await listRecentEfforts({
+        limit: 6,
+        habitId: effortFilter === 'all' ? null : effortFilter,
+      });
+      const evidenceSummary = await getEvidenceSummary();
+      const latestChest = await getLatestLockedChest();
+      setSnapshot(snap);
+      setInactivityDays(days);
+      setMercyStatus(mercy);
+      setHabits(habitList);
+      setChests(chestList);
+      setItems(itemList);
+      setCards(cardList);
+      setEfforts(effortList);
+      setEvidence(evidenceSummary);
+      setCombatChest(latestChest);
+      const currentEquipped = await getEquippedCardId();
+      setEquippedCardId(currentEquipped);
       await refreshArcQuests();
       if (habitList.length > 0) {
         const effortEntries = await Promise.all(
@@ -433,7 +436,29 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
         const active = habitList.find((habit) => habit.isActive);
         setHabitId(active ? active.id : habitList[0].id);
       }
+      await refreshHabitActionCounts(habitList);
     }
+
+  async function refreshHabitActionCounts(habitList) {
+    const totals = Object.fromEntries(habitList.map((habit) => [habit.id, 0]));
+    const waterHabits = habitList.filter(
+      (habit) => getHabitActionConfig(habit).type === 'water'
+    );
+    if (waterHabits.length === 0) {
+      setHabitActionCounts(totals);
+      return;
+    }
+    const entries = await Promise.all(
+      waterHabits.map(async (habit) => [
+        habit.id,
+        await countHabitActionsToday({ habitId: habit.id, actionType: 'water_cup' }),
+      ])
+    );
+    for (const [habitId, total] of entries) {
+      totals[habitId] = total;
+    }
+    setHabitActionCounts(totals);
+  }
 
   async function refreshArcQuests() {
     try {
@@ -450,6 +475,16 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
       await refreshArcQuests();
     } catch (error) {
       console.error('Failed to accept arc quest', error);
+    }
+  }
+
+  async function handleAcceptArcForHabit(arcId, habitId) {
+    if (!habitId) return;
+    try {
+      await bindArcQuestToHabit(arcId, habitId);
+      await refreshArcQuests();
+    } catch (error) {
+      console.error('Failed to bind arc quest to habit', error);
     }
   }
 
@@ -589,6 +624,28 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     [cards, equippedCardId]
   );
 
+  const challengeHabit = useMemo(() => {
+    if (!habits.length) return null;
+    if (selectedChallengeHabitId) {
+      return habitById.get(selectedChallengeHabitId) || habits[0];
+    }
+    return habits[0];
+  }, [habits, habitById, selectedChallengeHabitId]);
+  const challengeArcInfo = useMemo(() => findArcQuestForHabit(challengeHabit), [
+    arcQuests,
+    challengeHabit,
+  ]);
+  const challengeArcQuest = challengeArcInfo?.quest || null;
+  const challengeArcAccepted = challengeArcInfo?.accepted ?? false;
+  const challengeActionConfig = useMemo(
+    () => (challengeHabit ? getHabitActionConfig(challengeHabit) : null),
+    [challengeHabit]
+  );
+  const latestChallengeEffort = useMemo(
+    () => (challengeHabit ? getLatestEffortForHabit(challengeHabit.id) : null),
+    [challengeHabit, efforts]
+  );
+
   const orientationIdentity = snapshot?.identity;
   const shouldShowOrientation = Boolean(
     orientationIdentity &&
@@ -608,6 +665,20 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   useEffect(() => {
     refresh();
   }, [effortFilter]);
+
+  useEffect(() => {
+    if (habits.length === 0) {
+      setSelectedChallengeHabitId(null);
+      return;
+    }
+    setSelectedChallengeHabitId((prev) => {
+      if (prev && habits.some((habit) => habit.id === prev)) {
+        return prev;
+      }
+      const active = habits.find((habit) => habit.isActive);
+      return active ? active.id : habits[0].id;
+    });
+  }, [habits]);
 
 
   useEffect(() => {
@@ -987,25 +1058,34 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     }
   }
 
-  async function handleLogEffort(customHabitId, customHabitName) {
-    const targetHabitId = customHabitId || habitId;
+  async function handleLogEffort({
+    habitId: overrideHabitId,
+    note: overrideNote = null,
+    actionType: overrideActionType,
+    units: overrideUnits,
+  } = {}) {
+    const targetHabitId = overrideHabitId || habitId;
     if (!targetHabitId) return;
-    const targetHabit = customHabitName
-      ? { name: customHabitName, isActive: true }
-      : selectedHabit;
+    const targetHabit = habitById.get(targetHabitId) || selectedHabit;
     if (!targetHabit || !targetHabit.isActive) {
       return;
     }
-    const cleanedNote = effortNote.trim();
-      const result = await logEffort({
-        habitId: targetHabitId,
-        note: cleanedNote.length ? cleanedNote : null,
-      });
-      if (shouldShowOrientation) {
-        await markOrientationComplete();
-      setOrientationMessage('You logged effort. That\'s all this system ever asks.');
-      }
-      await refresh();
+    const actionConfig = getHabitActionConfig(targetHabit);
+    const resolvedActionType = overrideActionType || actionConfig.actionType || 'custom';
+    const resolvedUnits = overrideUnits ?? actionConfig.units ?? 1;
+    const noteSource = overrideNote !== null ? overrideNote : effortNote;
+    const cleanedNote = noteSource?.trim ? noteSource.trim() : '';
+    const result = await logEffort({
+      habitId: targetHabitId,
+      note: cleanedNote.length ? cleanedNote : null,
+      actionType: resolvedActionType,
+      units: resolvedUnits,
+    });
+    if (shouldShowOrientation) {
+      await markOrientationComplete();
+      setOrientationMessage("You logged effort. That's all this system ever asks.");
+    }
+    await refresh();
     setEffortNote('');
     if (result?.arcUnlocks?.length) {
       setArcOverlay(result.arcUnlocks[0]);
@@ -1036,6 +1116,16 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
         }
       }
     }
+  }
+
+  async function handleHabitAction(habit) {
+    if (!habit || !habit.isActive) return;
+    const config = getHabitActionConfig(habit);
+    await handleLogEffort({
+      habitId: habit.id,
+      actionType: config.actionType,
+      units: config.units,
+    });
   }
 
   async function handleCombat(outcome) {
@@ -1742,7 +1832,8 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     const name = formatHabitName(newHabitName);
     if (!name) return;
     const decorated = `${habitEmoji(name)} ${name}`;
-    const created = await createHabit(decorated);
+    const type = getHabitTypeFromName(decorated);
+    const created = await createHabit(decorated, type);
     setNewHabitName('');
     setHabitId(created.id);
     await refresh();
@@ -1984,6 +2075,56 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     return Array.from(tags);
   }
 
+  function getHabitTypeFromName(name, explicitType = 'generic') {
+    const hintedType = (explicitType || '').toString().toLowerCase();
+    if (['gym', 'water', 'generic'].includes(hintedType)) {
+      return hintedType;
+    }
+    const text = (name || '').toLowerCase();
+    if (text.includes('water') || text.includes('hydrate') || text.includes('cup')) {
+      return 'water';
+    }
+    if (
+      text.includes('gym') ||
+      text.includes('lift') ||
+      text.includes('train') ||
+      text.includes('workout') ||
+      text.includes('strength')
+    ) {
+      return 'gym';
+    }
+    return 'generic';
+  }
+
+  function getHabitActionConfig(habit) {
+    const type = getHabitTypeFromName(habit?.name, habit?.type);
+    if (type === 'gym') {
+      return {
+        label: 'Log Session',
+        actionType: 'gym_session',
+        units: 1,
+        type,
+        summary: 'Gym session',
+      };
+    }
+    if (type === 'water') {
+      return {
+        label: '+1 cup',
+        actionType: 'water_cup',
+        units: 1,
+        type,
+        summary: 'Hydration cup',
+      };
+    }
+    return {
+      label: 'Log Effort',
+      actionType: 'custom',
+      units: 1,
+      type,
+      summary: 'Effort',
+    };
+  }
+
   function getIdentityTitle(level) {
     if (level >= 20) return 'Relic-Bound';
     if (level >= 15) return 'Arckeeper';
@@ -2020,6 +2161,105 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     } catch (error) {
       return { modifiers: [], tag: '' };
     }
+  }
+
+  function formatScopeTag(scope) {
+    const type = scope?.type || 'any';
+    const value = scope?.value || '';
+    switch (type) {
+      case 'habitId': {
+        const habit = habitById.get(value);
+        const label = habit ? habit.name : value;
+        return `HABIT: ${label}`;
+      }
+      case 'habitType': {
+        const formatted = value ? value.toString().replace(/^\w/, (c) => c.toUpperCase()) : 'Habit';
+        return `TYPE: ${formatted}`;
+      }
+      case 'any':
+      default:
+        return 'ANY HABIT';
+    }
+  }
+
+  function findArcQuestForHabit(habit) {
+    if (!habit || arcQuests.length === 0) return null;
+    const habitId = habit.id;
+    const habitType = (habit.type || 'generic').toString().toLowerCase();
+    const matches = arcQuests
+      .map((quest) => {
+        const scope = quest.scope || { type: 'any', value: null };
+        const scopeType = (scope.type || 'any').toString().toLowerCase();
+        const scopeValue = scope.value;
+        if (scopeType === 'habitid' && scopeValue === habitId) {
+          return { quest, priority: 0 };
+        }
+        if (
+          scopeType === 'habittype' &&
+          scopeValue &&
+          scopeValue.toString().toLowerCase() === habitType
+        ) {
+          return { quest, priority: 1 };
+        }
+        if (scopeType === 'any') {
+          return { quest, priority: 2 };
+        }
+        return null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => {
+        if (a.quest.accepted && !b.quest.accepted) return -1;
+        if (!a.quest.accepted && b.quest.accepted) return 1;
+        return a.priority - b.priority;
+      });
+    const best = matches[0];
+    if (!best) return null;
+    return {
+      quest: best.quest,
+      accepted: Boolean(best.quest.accepted),
+    };
+  }
+
+  function isEffortWithinScope(effort, scope) {
+    if (!scope || !effort) return true;
+    const scopeType = (scope.type || 'any').toLowerCase();
+    const scopeValue = scope.value;
+    const habit = habitById.get(effort.habitId);
+    const habitType = (habit?.type || 'generic').toString().toLowerCase();
+    switch (scopeType) {
+      case 'habitid':
+        return effort.habitId === scopeValue;
+      case 'habittype':
+        return scopeValue && habitType === scopeValue.toString().toLowerCase();
+      case 'any':
+      default:
+        return true;
+    }
+  }
+
+  function getLatestEffortForQuest(quest) {
+    const matching = efforts
+      .filter((effort) => isEffortWithinScope(effort, quest.scope))
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    return matching[0] || null;
+  }
+
+  function getLatestEffortForHabit(habitId) {
+    if (!habitId) return null;
+    const matching = efforts
+      .filter((effort) => effort.habitId === habitId)
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    return matching[0] || null;
+  }
+
+  function formatEffortActionLabel(effort) {
+    if (!effort) return 'No progress tracked yet.';
+    const habit = habitById.get(effort.habitId);
+    const name = habit?.name || effort.habitName || 'Habit';
+    const action = effort.actionType?.replace('_', ' ') || 'effort';
+    const units = typeof effort.units === 'number' ? effort.units : effort.effortValue || 1;
+    const timestamp = new Date(effort.timestamp).toLocaleDateString();
+    return `Last logged ${action} for ${name} (${units} unit${units === 1 ? '' : 's'}) on ${timestamp}`;
   }
 
   const mainContent = (
@@ -3116,37 +3356,70 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
           {habits.length === 0 ? (
             <Text style={styles.subtle}>No habits yet. Create one below.</Text>
           ) : (
-            habits.map((habit) => (
-              <View key={habit.id} style={styles.habitRow}>
-                <Pressable
-                  style={[
-                    styles.habitChip,
-                    habitId === habit.id && styles.habitChipSelected,
-                    !habit.isActive && styles.habitChipDisabled,
-                  ]}
-                  onPress={() => setHabitId(habit.id)}
-                >
-                  <View style={styles.habitLabelRow}>
-                    <Text style={styles.habitText}>{habit.name}</Text>
-                    <Text style={styles.habitEffort}>
-                      {habitEfforts[habit.id]
-                        ? `${habitEfforts[habit.id].effort}/10 (${Math.round(
-                            habitEfforts[habit.id].prevalence
-                          )}% of US adults do this)`
-                        : ''}
-                    </Text>
+            habits.map((habit) => {
+              const actionConfig = getHabitActionConfig(habit);
+              const habitTypeLabel =
+                actionConfig.type === 'gym'
+                  ? 'Gym Habit'
+                  : actionConfig.type === 'water'
+                  ? 'Hydration Habit'
+                  : 'Habit Effort';
+              const waterCount = habitActionCounts[habit.id] ?? 0;
+              return (
+                <View key={habit.id} style={styles.habitBlock}>
+                  <View style={styles.habitRow}>
+                    <Pressable
+                      style={[
+                        styles.habitChip,
+                        habitId === habit.id && styles.habitChipSelected,
+                        !habit.isActive && styles.habitChipDisabled,
+                      ]}
+                      onPress={() => setHabitId(habit.id)}
+                    >
+                      <View style={styles.habitLabelRow}>
+                        <Text style={styles.habitText}>{habit.name}</Text>
+                        <Text style={styles.habitEffort}>
+                          {habitEfforts[habit.id]
+                            ? `${habitEfforts[habit.id].effort}/10 (${Math.round(
+                                habitEfforts[habit.id].prevalence
+                              )}% of US adults do this)`
+                            : ''}
+                        </Text>
+                      </View>
+                    </Pressable>
+                    <View style={styles.habitActions}>
+                      <Pressable style={styles.habitToggle} onPress={() => handleToggleHabit(habit)}>
+                        <Text style={styles.habitToggleText}>{habit.isActive ? 'Active' : 'Paused'}</Text>
+                      </Pressable>
+                      <Pressable style={styles.habitDelete} onPress={() => handleDeleteHabit(habit)}>
+                        <Text style={styles.habitDeleteText}>Delete</Text>
+                      </Pressable>
+                    </View>
                   </View>
-                </Pressable>
-                <View style={styles.habitActions}>
-                  <Pressable style={styles.habitToggle} onPress={() => handleToggleHabit(habit)}>
-                    <Text style={styles.habitToggleText}>{habit.isActive ? 'Active' : 'Paused'}</Text>
-                  </Pressable>
-                  <Pressable style={styles.habitDelete} onPress={() => handleDeleteHabit(habit)}>
-                    <Text style={styles.habitDeleteText}>Delete</Text>
-                  </Pressable>
+                  <View style={styles.habitActionRow}>
+                    <View style={styles.habitActionDetails}>
+                      <Text style={styles.habitActionLabel}>{habitTypeLabel}</Text>
+                      <Text style={styles.habitActionSummary}>{actionConfig.summary}</Text>
+                      {actionConfig.type === 'water' ? (
+                        <Text style={styles.habitActionCounter}>
+                          {waterCount} cup{waterCount === 1 ? '' : 's'} logged today
+                        </Text>
+                      ) : null}
+                    </View>
+                    <Pressable
+                      style={[
+                        styles.habitActionButton,
+                        !habit.isActive && styles.buttonDisabled,
+                      ]}
+                      onPress={() => handleHabitAction(habit)}
+                      disabled={!habit.isActive}
+                    >
+                      <Text style={styles.habitActionButtonText}>{actionConfig.label}</Text>
+                    </Pressable>
+                  </View>
                 </View>
-              </View>
-            ))
+              );
+            })
           )}
           <View style={styles.menuDivider} />
           <Text style={styles.panelTitle}>Log Effort</Text>
@@ -3171,7 +3444,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
               />
               <Pressable
                 style={[styles.button, !selectedHabit.isActive && styles.buttonDisabled]}
-                onPress={() => handleLogEffort(selectedHabit.id, selectedHabit.name)}
+                onPress={() => handleLogEffort({ habitId: selectedHabit.id })}
                 disabled={!selectedHabit.isActive}
               >
                 <Text style={styles.buttonText}>Log effort</Text>
@@ -3225,6 +3498,107 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
 
       {showChallenges ? (
         <View style={styles.panel}>
+          <Text style={styles.panelTitle}>Habit Journeys</Text>
+          {habits.length === 0 ? (
+            <Text style={styles.subtle}>Create a habit to discover its journey.</Text>
+          ) : (
+            <>
+              <View style={styles.challengeHabitRow}>
+                {habits.map((habit) => (
+                  <Pressable
+                    key={habit.id}
+                    style={[
+                      styles.challengeHabitChip,
+                      selectedChallengeHabitId === habit.id && styles.challengeHabitChipActive,
+                    ]}
+                    onPress={() => setSelectedChallengeHabitId(habit.id)}
+                  >
+                    <Text style={styles.challengeHabitText}>{habit.name}</Text>
+                  </Pressable>
+                ))}
+              </View>
+              {challengeHabit ? (
+                <View style={styles.challengeCard}>
+                  <View style={styles.challengeCardHeader}>
+                    <View>
+                      <Text style={styles.challengeCardTag}>
+                        {challengeArcQuest ? 'Arc Quest' : 'Habit Journey'}
+                      </Text>
+                      <Text style={styles.challengeCardTitle}>
+                        {challengeArcQuest ? challengeArcQuest.title : challengeHabit.name}
+                      </Text>
+                    </View>
+                    {challengeArcQuest ? (
+                      <Text style={styles.challengeCardScope}>
+                        {formatScopeTag(challengeArcQuest.scope)}
+                      </Text>
+                    ) : null}
+                  </View>
+                  <Text style={styles.arcFeedTheme}>
+                    {challengeArcQuest?.theme || 'Your habit, your story.'}
+                  </Text>
+                  <Text style={styles.subtle}>
+                    {challengeArcQuest?.summary ||
+                      'No arc quest is tied to this habit yet. Keep showing up and one will appear.'}
+                  </Text>
+                  {challengeArcQuest ? (
+                    <View style={styles.arcProgressRow}>
+                      <Text style={styles.arcProgressValue}>{challengeArcQuest.progress} effort</Text>
+                      <Text style={styles.arcProgressMeta}>
+                        {challengeArcQuest.unlockedCount}/{challengeArcQuest.totalFragments} fragments
+                      </Text>
+                    </View>
+                  ) : (
+                    <Text style={styles.arcProgressMeta}>
+                      Arc quest details show up once the journey is unlocked or linked.
+                    </Text>
+                  )}
+                  <Text style={styles.arcProgressMeta}>
+                    {formatEffortActionLabel(latestChallengeEffort)}
+                  </Text>
+                  <View style={styles.challengeButtonRow}>
+                    {challengeArcQuest && !challengeArcAccepted ? (
+                      <Pressable
+                        style={styles.challengeAcceptButton}
+                        onPress={() =>
+                          handleAcceptArcForHabit(challengeArcQuest.id, challengeHabit.id)
+                        }
+                        disabled={!challengeHabit.isActive}
+                      >
+                        <Text style={styles.challengeAcceptButtonText}>Accept arc quest</Text>
+                      </Pressable>
+                    ) : null}
+                    <Pressable
+                      style={[
+                        styles.challengeLogButton,
+                        !challengeHabit.isActive && styles.buttonDisabled,
+                      ]}
+                      onPress={() => handleHabitAction(challengeHabit)}
+                      disabled={!challengeHabit.isActive}
+                    >
+                      <Text style={styles.challengeLogButtonText}>
+                        {challengeActionConfig?.label || 'Log effort'}
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.challengeToggleButton]}
+                      onPress={() => handleToggleHabit(challengeHabit)}
+                    >
+                      <Text style={styles.challengeToggleButtonText}>
+                        {challengeHabit.isActive ? 'Pause' : 'Resume'}
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.challengeDeleteButton]}
+                      onPress={() => handleDeleteHabit(challengeHabit)}
+                    >
+                      <Text style={styles.challengeDeleteButtonText}>Delete habit</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              ) : null}
+            </>
+          )}
           <Text style={styles.panelTitle}>Recent Efforts</Text>
           <View style={styles.filterRow}>
             <Pressable
@@ -3857,6 +4231,153 @@ const styles = StyleSheet.create({
   },
   arcList: {
     gap: 12,
+  },
+  arcFeed: {
+    gap: 10,
+    marginBottom: 14,
+  },
+  arcFeedCard: {
+    borderWidth: 1,
+    borderColor: '#1f3865',
+    borderRadius: 12,
+    padding: 12,
+    backgroundColor: '#0c1429',
+  },
+  arcFeedHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    marginBottom: 6,
+  },
+  arcFeedTitle: {
+    color: '#f6c46a',
+    fontSize: FONT.lg,
+    fontWeight: '700',
+  },
+  arcFeedScope: {
+    color: '#9dfbff',
+    fontSize: FONT.xs,
+    letterSpacing: 0.8,
+  },
+  arcFeedTheme: {
+    color: '#cfeaff',
+    fontSize: FONT.sm,
+    marginBottom: 4,
+  },
+  challengeCardTag: {
+    color: '#9fd6ff',
+    fontSize: FONT.xs,
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+    marginBottom: 2,
+  },
+  challengeHabitRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 12,
+  },
+  challengeHabitChip: {
+    borderWidth: 1,
+    borderColor: '#2b4e82',
+    borderRadius: 999,
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    backgroundColor: '#0c1429',
+  },
+  challengeHabitChipActive: {
+    borderColor: '#7bc7ff',
+    backgroundColor: '#102244',
+  },
+  challengeHabitText: {
+    color: '#c7e2ff',
+    fontSize: FONT.sm,
+    letterSpacing: 0.5,
+  },
+  challengeCard: {
+    borderWidth: 1,
+    borderColor: '#1f3865',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 14,
+    backgroundColor: '#0a1226',
+  },
+  challengeCardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    marginBottom: 6,
+  },
+  challengeCardTitle: {
+    color: '#f6c46a',
+    fontSize: FONT.lg,
+    fontWeight: '700',
+  },
+  challengeCardScope: {
+    color: '#9dfbff',
+    fontSize: FONT.xs,
+    letterSpacing: 0.8,
+  },
+  challengeButtonRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 12,
+    justifyContent: 'flex-start',
+  },
+  challengeLogButton: {
+    borderWidth: 1,
+    borderColor: '#65c0ff',
+    borderRadius: 12,
+    backgroundColor: '#1a3c70',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+  },
+  challengeLogButtonText: {
+    color: '#fff',
+    fontSize: FONT.sm,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+  },
+  challengeToggleButton: {
+    borderWidth: 1,
+    borderColor: '#7ad6ff',
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    backgroundColor: '#122444',
+  },
+  challengeToggleButtonText: {
+    color: '#c7e2ff',
+    fontSize: FONT.sm,
+    letterSpacing: 0.6,
+  },
+  challengeDeleteButton: {
+    borderWidth: 1,
+    borderColor: '#ff7070',
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    backgroundColor: '#20131d',
+  },
+  challengeDeleteButtonText: {
+    color: '#ffb0b0',
+    fontSize: FONT.sm,
+    letterSpacing: 0.6,
+  },
+  challengeAcceptButton: {
+    borderWidth: 1,
+    borderColor: '#9ef5c2',
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    backgroundColor: '#12331c',
+  },
+  challengeAcceptButtonText: {
+    color: '#b5ffd6',
+    fontSize: FONT.sm,
+    fontWeight: '700',
+    letterSpacing: 0.6,
   },
   arcCard: {
     borderWidth: 1,
@@ -4491,6 +5012,49 @@ const styles = StyleSheet.create({
     color: '#f2b8c6',
     fontSize: 11,
     fontWeight: '700',
+  },
+  habitBlock: {
+    marginBottom: 14,
+    gap: 6,
+  },
+  habitActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  habitActionDetails: {
+    flex: 1,
+  },
+  habitActionLabel: {
+    color: '#9fd6ff',
+    fontSize: 11,
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+  },
+  habitActionSummary: {
+    color: '#c7e2ff',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  habitActionCounter: {
+    color: '#9ef5c2',
+    fontSize: 11,
+    marginTop: 2,
+  },
+  habitActionButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#4ea0ff',
+    backgroundColor: '#12315a',
+  },
+  habitActionButtonText: {
+    color: '#ffffff',
+    fontSize: FONT.md,
+    fontWeight: '700',
+    letterSpacing: 0.6,
   },
   habitInputRow: {
     flexDirection: 'row',
