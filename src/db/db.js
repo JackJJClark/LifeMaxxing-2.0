@@ -1,6 +1,7 @@
 import { Platform } from 'react-native';
 import * as SQLite from 'expo-sqlite';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { isEncryptedPayload, validateBackupPayload, totalBackupCount } from './backupValidation';
 
 const DB_NAME = 'lifemaxing.db';
 const isWeb = Platform.OS === 'web';
@@ -36,7 +37,10 @@ function loadWebStore() {
     if (!raw) return;
     const data = JSON.parse(raw);
     if (!data || typeof data !== 'object') return;
-    webStore.identity = data.identity || null;
+    const storedIdentity = data.identity || null;
+    webStore.identity = storedIdentity
+      ? { ...storedIdentity, equippedCardId: storedIdentity.equippedCardId || null }
+      : null;
     webStore.habits = Array.isArray(data.habits) ? data.habits : [];
     webStore.effortLogs = Array.isArray(data.effortLogs) ? data.effortLogs : [];
     webStore.chests = Array.isArray(data.chests) ? data.chests : [];
@@ -501,7 +505,8 @@ export async function initDb() {
       level INTEGER NOT NULL,
       totalEffortUnits INTEGER NOT NULL,
       createdAt TEXT NOT NULL,
-      lastActiveAt TEXT NOT NULL
+      lastActiveAt TEXT NOT NULL,
+      orientationCompleted INTEGER NOT NULL DEFAULT 0
     )`
   );
 
@@ -577,6 +582,9 @@ export async function initDb() {
       arcId TEXT PRIMARY KEY NOT NULL,
       progress INTEGER NOT NULL,
       unlockedCount INTEGER NOT NULL,
+      accepted INTEGER NOT NULL DEFAULT 0,
+      ignored INTEGER NOT NULL DEFAULT 0,
+      habitId TEXT,
       updatedAt TEXT NOT NULL
     )`
   );
@@ -630,6 +638,11 @@ export async function initDb() {
   await ensureColumn('items', 'metaJson', 'TEXT');
   await ensureColumn('chest_rewards', 'rewardType', 'TEXT');
   await ensureColumn('chest_rewards', 'rewardId', 'TEXT');
+  await ensureColumn('arc_quest_progress', 'accepted', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn('arc_quest_progress', 'ignored', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn('arc_quest_progress', 'habitId', 'TEXT');
+  await ensureColumn('identity', 'orientationCompleted', 'INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn('identity', 'equippedCardId', 'TEXT');
 }
 
 export async function getHabitEffortForName(habitName) {
@@ -687,6 +700,7 @@ export async function getOrCreateIdentity() {
       totalEffortUnits: 0,
       createdAt,
       lastActiveAt: createdAt,
+      equippedCardId: null,
     };
     saveWebStore();
     return webStore.identity;
@@ -699,8 +713,8 @@ export async function getOrCreateIdentity() {
   const id = makeId('identity');
   const createdAt = nowIso();
   await execSql(
-    'INSERT INTO identity (id, level, totalEffortUnits, createdAt, lastActiveAt) VALUES (?, ?, ?, ?, ?)',
-    [id, 1, 0, createdAt, createdAt]
+    'INSERT INTO identity (id, level, totalEffortUnits, createdAt, lastActiveAt, orientationCompleted, equippedCardId) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [id, 1, 0, createdAt, createdAt, 0, null]
   );
 
   const created = await execSql('SELECT * FROM identity LIMIT 1');
@@ -717,6 +731,30 @@ export async function touchLastActive() {
     return;
   }
   await execSql('UPDATE identity SET lastActiveAt = ? WHERE id IN (SELECT id FROM identity LIMIT 1)', [timestamp]);
+}
+
+async function persistEquippedCardId(value) {
+  const nextValue = value || null;
+  if (isWeb) {
+    if (webStore.identity) {
+      webStore.identity.equippedCardId = nextValue;
+      saveWebStore();
+    }
+    return;
+  }
+  await execSql(
+    'UPDATE identity SET equippedCardId = ? WHERE id IN (SELECT id FROM identity LIMIT 1)',
+    [nextValue]
+  );
+}
+
+export async function getEquippedCardId() {
+  if (isWeb) {
+    return webStore.identity ? webStore.identity.equippedCardId || null : null;
+  }
+  const result = await execSql('SELECT equippedCardId FROM identity LIMIT 1');
+  if (result.rows.length === 0) return null;
+  return result.rows.item(0).equippedCardId || null;
 }
 
 export async function getInactivityDays() {
@@ -784,6 +822,219 @@ export async function listHabits() {
     items.push(result.rows.item(i));
   }
   return items;
+}
+
+async function fetchChestDetail(chestId) {
+  if (!chestId) return null;
+  if (isWeb) {
+    const chest = webStore.chests.find((item) => item.id === chestId);
+    if (!chest) return null;
+    const rewards = webStore.chestRewards.filter((reward) => reward.chestId === chestId);
+    const meta = webStore.chestMeta.find((entry) => entry.chestId === chestId);
+    return {
+      id: chest.id,
+      rarity: chest.rarity,
+      tier: chest.tier || 'weathered',
+      earnedAt: chest.earnedAt,
+      unlockedRewardCount: chest.unlockedRewardCount || 0,
+      rewardCount: rewards.length,
+      lockedCount: rewards.filter((reward) => reward.locked).length,
+      theme: meta?.theme || null,
+      habitName: meta?.habitName || null,
+    };
+  }
+  const result = await execSql(
+    `SELECT c.id, c.rarity, c.tier, c.earnedAt, c.unlockedRewardCount,
+      m.theme as theme, m.habitName as habitName,
+      (SELECT COUNT(*) FROM chest_rewards cr WHERE cr.chestId = c.id) as rewardCount,
+      (SELECT COUNT(*) FROM chest_rewards cr WHERE cr.chestId = c.id AND cr.locked = 1) as lockedCount
+     FROM chests c
+     LEFT JOIN chest_meta m ON m.chestId = c.id
+     WHERE c.id = ?`,
+    [chestId]
+  );
+  if (result.rows.length === 0) return null;
+  const row = result.rows.item(0);
+  return {
+    id: row.id,
+    rarity: row.rarity,
+    tier: row.tier || 'weathered',
+    earnedAt: row.earnedAt,
+    unlockedRewardCount: row.unlockedRewardCount || 0,
+    rewardCount: row.rewardCount || 0,
+    lockedCount: row.lockedCount || 0,
+    theme: row.theme || null,
+    habitName: row.habitName || null,
+  };
+}
+
+async function fetchChestRewards(chestId) {
+  if (!chestId) return [];
+  if (isWeb) {
+    return webStore.chestRewards
+      .filter((reward) => reward.chestId === chestId)
+      .map((reward) => {
+        const rewardType = reward.rewardType || (reward.itemId ? 'item' : 'card');
+        const card = rewardType === 'card'
+          ? webStore.cards.find((cardItem) => cardItem.id === reward.rewardId)
+          : null;
+        const item = rewardType === 'item'
+          ? webStore.items.find((itemRecord) => itemRecord.id === reward.rewardId)
+          : null;
+        const name = card
+          ? cardInfoByKey(card.cardKey)?.name || card.cardKey
+          : item?.name || 'Item';
+        const rarity = card?.rarity || item?.rarity || 'common';
+        return {
+          id: reward.id,
+          type: rewardType,
+          name,
+          rarity,
+          locked: reward.locked,
+        };
+      });
+  }
+  const result = await execSql(
+    `SELECT cr.id, cr.rewardType, cr.rewardId, cr.itemId, cr.locked,
+      c.cardKey, c.rarity as cardRarity,
+      i.name as itemName, i.rarity as itemRarity
+     FROM chest_rewards cr
+     LEFT JOIN cards c ON c.id = cr.rewardId
+     LEFT JOIN items i ON i.id = cr.itemId
+     WHERE cr.chestId = ?`,
+    [chestId]
+  );
+  const rewards = [];
+  for (let i = 0; i < result.rows.length; i += 1) {
+    const row = result.rows.item(i);
+    const rewardType = row.rewardType || (row.cardKey ? 'card' : 'item');
+    const name = rewardType === 'card'
+      ? cardInfoByKey(row.cardKey)?.name || row.cardKey || 'Card'
+      : row.itemName || 'Item';
+    const rarity = row.cardRarity || row.itemRarity || 'common';
+    rewards.push({
+      id: row.id,
+      type: rewardType,
+      name,
+      rarity,
+      locked: Boolean(row.locked),
+    });
+  }
+  return rewards;
+}
+
+export async function adminOpenChest({ chestId }) {
+  if (!chestId) throw new Error('Chest id required.');
+  const chest = await fetchChestDetail(chestId);
+  if (!chest) throw new Error('Chest not found.');
+  const rewards = await fetchChestRewards(chestId);
+  return { ...chest, rewards };
+}
+
+export async function adminUnlockAllChestRewards({ chestId }) {
+  if (!chestId) throw new Error('Chest id required.');
+  if (isWeb) {
+    const rewards = webStore.chestRewards.filter((reward) => reward.chestId === chestId);
+    rewards.forEach((reward) => {
+      reward.locked = false;
+    });
+    const chest = webStore.chests.find((item) => item.id === chestId);
+    if (chest) {
+      chest.unlockedRewardCount = rewards.length;
+    }
+    saveWebStore();
+  } else {
+    await execSql('UPDATE chest_rewards SET locked = 0 WHERE chestId = ?', [chestId]);
+    const countResult = await execSql(
+      'SELECT COUNT(*) as count FROM chest_rewards WHERE chestId = ?',
+      [chestId]
+    );
+    const totalRewards = countResult.rows.length ? countResult.rows.item(0).count || 0 : 0;
+    await execSql('UPDATE chests SET unlockedRewardCount = ? WHERE id = ?', [totalRewards, chestId]);
+  }
+  return adminOpenChest({ chestId });
+}
+
+export async function adminSpawnChest({
+  rarity = 'common',
+  tier = 'weathered',
+  qty = 1,
+  forcedRewards = null,
+} = {}) {
+  const normalizedQty = Math.max(1, Math.min(10, Number.parseInt(qty, 10) || 1));
+  const normalizedRarity = normalizeRarity(rarity, 'common');
+  const normalizedTier = CHEST_TIERS.includes(tier) ? tier : 'weathered';
+  const storedForced = Array.isArray(forcedRewards) ? forcedRewards : null;
+  const results = [];
+  for (let i = 0; i < normalizedQty; i += 1) {
+    const chestId = makeId('chest');
+    const earnedAt = nowIso();
+    if (isWeb) {
+      webStore.chests.push({
+        id: chestId,
+        rarity: normalizedRarity,
+        tier: normalizedTier,
+        earnedAt,
+        unlockedRewardCount: 0,
+      });
+      webStore.chestMeta.push({
+        chestId,
+        habitId: null,
+        habitName: 'Admin Tools',
+        effortValue: 0,
+        consistencyCount: 0,
+        theme: 'admin',
+        createdAt: earnedAt,
+      });
+      saveWebStore();
+    } else {
+      await execSql(
+        'INSERT INTO chests (id, rarity, tier, earnedAt, unlockedRewardCount) VALUES (?, ?, ?, ?, 0)',
+        [chestId, normalizedRarity, normalizedTier, earnedAt]
+      );
+      await execSql(
+        'INSERT INTO chest_meta (chestId, habitId, habitName, effortValue, consistencyCount, theme, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [chestId, null, 'Admin Tools', 0, 0, 'admin', earnedAt]
+      );
+    }
+    await createChestRewards(chestId, normalizedRarity, 0, normalizedTier, {
+      forcedRewards: storedForced,
+    });
+    const chestDetails = await fetchChestDetail(chestId);
+    if (chestDetails) {
+      results.push(chestDetails);
+    }
+  }
+  return results;
+}
+
+export async function adminGrantCard({ cardKey, qty = 1 } = {}) {
+  const normalizedQty = Math.max(1, Math.min(10, Number.parseInt(qty, 10) || 1));
+  const resolvedKey = (cardKey || CARD_CATALOG[0]?.key || 'return_signal').toString();
+  const beforeCount = await countCards();
+  const grantedIds = [];
+  for (let i = 0; i < normalizedQty; i += 1) {
+    const info = cardInfoByKey(resolvedKey);
+    const card = {
+      key: info?.key || resolvedKey,
+      rarity: normalizeRarity(info?.rarity, 'common'),
+    };
+    const cardId = await createCardRecord(card);
+    grantedIds.push(cardId);
+  }
+  const totalAfter = await countCards();
+  let autoEquippedCardId = null;
+  if (beforeCount < 2 && grantedIds.length > 0) {
+    autoEquippedCardId = grantedIds[grantedIds.length - 1];
+    await persistEquippedCardId(autoEquippedCardId);
+  }
+  const currentEquippedCardId = await getEquippedCardId();
+  return {
+    grantedCount: normalizedQty,
+    totalOwned: totalAfter,
+    autoEquippedCardId,
+    currentEquippedCardId,
+  };
 }
 
 async function getHabitNameById(habitId) {
@@ -920,8 +1171,72 @@ function pickRewardType(tier) {
   return Math.random() < 0.25 ? 'card' : 'item';
 }
 
-async function createChestRewards(chestId, rarity, consistencyCount = 0, tier = 'weathered') {
-  const rewardCount = rewardCountForTier(tier);
+async function persistChestReward(chestId, rewardId, rewardType, rewardRef, itemId = null) {
+  if (isWeb) {
+    webStore.chestRewards.push({
+      id: rewardId,
+      chestId,
+      itemId,
+      rewardType,
+      rewardId: rewardRef,
+      locked: true,
+    });
+    return;
+  }
+  await execSql(
+    'INSERT INTO chest_rewards (id, chestId, itemId, rewardType, rewardId, locked) VALUES (?, ?, ?, ?, ?, 1)',
+    [rewardId, chestId, itemId, rewardType, rewardRef]
+  );
+}
+
+async function createForcedChestReward(chestId, fallbackRarity, rewardDef) {
+  if (!rewardDef || typeof rewardDef !== 'object') return;
+  const normalizedRarity = normalizeRarity(rewardDef.rarity, fallbackRarity);
+  const rewardType = rewardDef.type && rewardDef.type.toLowerCase() === 'card' ? 'card' : 'item';
+  const chestRewardId = makeId('reward');
+  let rewardRef = null;
+  let itemId = null;
+  if (rewardType === 'card') {
+    const cardKey = (rewardDef.refId || CARD_CATALOG[0]?.key || 'return_signal').toString();
+    const info = cardInfoByKey(cardKey);
+    const card = {
+      key: info?.key || cardKey,
+      rarity: normalizeRarity(info?.rarity, normalizedRarity),
+    };
+    rewardRef = await createCardRecord(card, chestId);
+  } else {
+    const itemKey = (rewardDef.refId || ITEM_CATALOG[0]?.key || 'rusty_key').toString();
+    const info = itemInfoByKey(itemKey);
+    const item = {
+      type: info?.type || 'artifact',
+      rarity: normalizeRarity(info?.rarity, normalizedRarity),
+      name: info?.name || 'Admin Reward',
+      effect: info?.effect || 'Admin-spawned reward.',
+      meta: { key: itemKey },
+    };
+    rewardRef = await createItemRecord(item);
+    itemId = rewardRef;
+  }
+  await persistChestReward(chestId, chestRewardId, rewardType, rewardRef, itemId);
+}
+
+async function createChestRewards(
+  chestId,
+  rarity,
+  consistencyCount = 0,
+  tier = 'weathered',
+  options = {}
+) {
+  const rewardTier = CHEST_TIERS.includes(tier) ? tier : 'weathered';
+  const baseRarity = normalizeRarity(rarity, 'common');
+  const forcedRewards = Array.isArray(options.forcedRewards) ? options.forcedRewards : null;
+  if (forcedRewards && forcedRewards.length > 0) {
+    for (const rewardDef of forcedRewards) {
+      await createForcedChestReward(chestId, baseRarity, rewardDef);
+    }
+    return;
+  }
+  const rewardCount = rewardCountForTier(rewardTier);
   let bonus = 0;
   if (consistencyCount >= 7 && Math.random() < 0.5) {
     bonus += 1;
@@ -933,32 +1248,18 @@ async function createChestRewards(chestId, rarity, consistencyCount = 0, tier = 
 
   for (let i = 0; i < totalRewards; i += 1) {
     const rewardId = makeId('reward');
-    const rewardType = pickRewardType(tier);
+    const rewardType = pickRewardType(rewardTier);
     let rewardRef = null;
     let itemId = null;
     if (rewardType === 'card') {
-      const card = generateCard(rarity);
+      const card = generateCard(baseRarity);
       rewardRef = await createCardRecord(card, chestId);
     } else {
-      const item = generateItem(rarity);
+      const item = generateItem(baseRarity);
       itemId = await createItemRecord(item);
       rewardRef = itemId;
     }
-    if (isWeb) {
-      webStore.chestRewards.push({
-        id: rewardId,
-        chestId,
-        itemId,
-        rewardType,
-        rewardId: rewardRef,
-        locked: true,
-      });
-    } else {
-      await execSql(
-        'INSERT INTO chest_rewards (id, chestId, itemId, rewardType, rewardId, locked) VALUES (?, ?, ?, ?, ?, 1)',
-        [rewardId, chestId, itemId, rewardType, rewardRef]
-      );
-    }
+    await persistChestReward(chestId, rewardId, rewardType, rewardRef, itemId);
   }
 }
 
@@ -1029,75 +1330,113 @@ async function updateIdentityTotals(effortValue) {
   );
 }
 
+export async function markOrientationComplete() {
+  if (isWeb) {
+    if (!webStore.identity) return;
+    webStore.identity.orientationCompleted = 1;
+    saveWebStore();
+    return;
+  }
+  await execSql(
+    'UPDATE identity SET orientationCompleted = 1 WHERE id IN (SELECT id FROM identity LIMIT 1)'
+  );
+}
+
 function unlockedCountForQuest(quest, progress) {
   return quest.milestones.filter((threshold) => progress >= threshold).length;
 }
 
-async function ensureArcQuestProgress() {
-  if (isWeb) {
-    const map = new Map(webStore.arcQuestProgress.map((row) => [row.arcId, row]));
-    ARC_QUESTS.forEach((quest) => {
+  async function ensureArcQuestProgress() {
+    if (isWeb) {
+      const map = new Map(webStore.arcQuestProgress.map((row) => [row.arcId, row]));
+      ARC_QUESTS.forEach((quest) => {
+        if (!map.has(quest.id)) {
+          const record = {
+            arcId: quest.id,
+            progress: 0,
+            unlockedCount: 0,
+            accepted: 0,
+            ignored: 0,
+            habitId: null,
+            updatedAt: nowIso(),
+          };
+          webStore.arcQuestProgress.push(record);
+          map.set(quest.id, record);
+        }
+      });
+      return map;
+    }
+
+    const rows = await fetchAllRows(
+      'SELECT arcId, progress, unlockedCount, accepted, ignored, habitId, updatedAt FROM arc_quest_progress'
+    );
+    const map = new Map(rows.map((row) => [row.arcId, row]));
+    for (const quest of ARC_QUESTS) {
       if (!map.has(quest.id)) {
         const record = {
           arcId: quest.id,
           progress: 0,
           unlockedCount: 0,
+          accepted: 0,
+          ignored: 0,
+          habitId: null,
           updatedAt: nowIso(),
         };
-        webStore.arcQuestProgress.push(record);
+        await execSql(
+          'INSERT INTO arc_quest_progress (arcId, progress, unlockedCount, accepted, ignored, habitId, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [
+            record.arcId,
+            record.progress,
+            record.unlockedCount,
+            record.accepted,
+            record.ignored,
+            record.habitId,
+            record.updatedAt,
+          ]
+        );
         map.set(quest.id, record);
       }
-    });
+    }
     return map;
   }
 
-  const rows = await fetchAllRows('SELECT arcId, progress, unlockedCount, updatedAt FROM arc_quest_progress');
-  const map = new Map(rows.map((row) => [row.arcId, row]));
-  for (const quest of ARC_QUESTS) {
-    if (!map.has(quest.id)) {
-      const record = {
-        arcId: quest.id,
-        progress: 0,
-        unlockedCount: 0,
-        updatedAt: nowIso(),
-      };
-      await execSql(
-        'INSERT INTO arc_quest_progress (arcId, progress, unlockedCount, updatedAt) VALUES (?, ?, ?, ?)',
-        [record.arcId, record.progress, record.unlockedCount, record.updatedAt]
-      );
-      map.set(quest.id, record);
-    }
-  }
-  return map;
-}
-
 export async function listArcQuestStatus() {
   const progressMap = await ensureArcQuestProgress();
-  return ARC_QUESTS.map((quest) => {
-    const record = progressMap.get(quest.id);
-    const progress = record ? record.progress : 0;
-    const unlockedCount = record ? record.unlockedCount : 0;
-    const nextMilestone = quest.milestones.find((value) => value > progress) || null;
-    return {
-      id: quest.id,
-      title: quest.title,
-      theme: quest.theme,
-      summary: quest.summary,
-      progress,
-      unlockedCount,
-      totalFragments: quest.fragments.length,
+    return ARC_QUESTS.map((quest) => {
+      const record = progressMap.get(quest.id);
+      const progress = record ? record.progress : 0;
+      const unlockedCount = record ? record.unlockedCount : 0;
+      const nextMilestone = quest.milestones.find((value) => value > progress) || null;
+      return {
+        id: quest.id,
+        title: quest.title,
+        theme: quest.theme,
+        summary: quest.summary,
+        accepted: record ? Boolean(record.accepted) : false,
+        ignored: record ? Boolean(record.ignored) : false,
+        habitId: record ? record.habitId || null : null,
+        progress,
+        unlockedCount,
+        totalFragments: quest.fragments.length,
       nextMilestone,
       fragments: quest.fragments.slice(0, unlockedCount),
     };
   });
 }
 
-async function updateArcQuestProgress(delta) {
+async function updateArcQuestProgress(delta, habitId = null) {
   const progressMap = await ensureArcQuestProgress();
   const unlocked = [];
   for (const quest of ARC_QUESTS) {
     const record = progressMap.get(quest.id);
     if (!record) continue;
+    if (record.ignored) {
+      continue;
+    }
+    const boundHabitId = record.habitId || null;
+    if (boundHabitId && boundHabitId !== habitId) {
+      continue;
+    }
     const prevUnlocked = record.unlockedCount;
     const nextProgress = record.progress + delta;
     const nextUnlocked = unlockedCountForQuest(quest, nextProgress);
@@ -1120,6 +1459,53 @@ async function updateArcQuestProgress(delta) {
     }
   }
   return unlocked;
+}
+
+async function updateArcQuestRecord(arcId, updates) {
+  if (!arcId || !updates || typeof updates !== 'object') return;
+  const columns = [];
+  const params = [];
+  if (updates.accepted !== undefined) {
+    columns.push('accepted = ?');
+    params.push(updates.accepted ? 1 : 0);
+  }
+  if (updates.ignored !== undefined) {
+    columns.push('ignored = ?');
+    params.push(updates.ignored ? 1 : 0);
+  }
+  const hasHabitId = Object.prototype.hasOwnProperty.call(updates, 'habitId');
+  if (hasHabitId) {
+    columns.push('habitId = ?');
+    params.push(updates.habitId || null);
+  }
+  if (columns.length === 0) return;
+  const updatedAt = nowIso();
+  if (isWeb) {
+    const record = webStore.arcQuestProgress.find((row) => row.arcId === arcId);
+    if (!record) return;
+    if (updates.accepted !== undefined) record.accepted = updates.accepted ? 1 : 0;
+    if (updates.ignored !== undefined) record.ignored = updates.ignored ? 1 : 0;
+    if (hasHabitId) record.habitId = updates.habitId || null;
+    record.updatedAt = updatedAt;
+    saveWebStore();
+    return;
+  }
+  columns.push('updatedAt = ?');
+  params.push(updatedAt);
+  params.push(arcId);
+  await execSql(`UPDATE arc_quest_progress SET ${columns.join(', ')} WHERE arcId = ?`, params);
+}
+
+export async function acceptArcQuest(arcId) {
+  await updateArcQuestRecord(arcId, { accepted: true, ignored: false });
+}
+
+export async function ignoreArcQuest(arcId) {
+  await updateArcQuestRecord(arcId, { accepted: false, ignored: true });
+}
+
+export async function bindArcQuestToHabit(arcId, habitId) {
+  await updateArcQuestRecord(arcId, { habitId, accepted: true });
 }
 
 export async function logEffort({ habitId, note }) {
@@ -1146,7 +1532,7 @@ export async function logEffort({ habitId, note }) {
   }
 
   await updateIdentityTotals(resolvedEffort);
-  const arcUnlocks = await updateArcQuestProgress(resolvedEffort);
+    const arcUnlocks = await updateArcQuestProgress(resolvedEffort, habitId);
 
   const consistency = await getConsistencyScore();
   const chestId = makeId('chest');
@@ -1333,6 +1719,18 @@ function cardInfoByKey(cardKey) {
   return CARD_CATALOG.find((card) => card.key === cardKey) || null;
 }
 
+function itemInfoByKey(itemKey) {
+  return ITEM_CATALOG.find((item) => item.key === itemKey) || null;
+}
+
+function normalizeRarity(value, fallback = 'common') {
+  const normalized = (value || fallback).toString().toLowerCase();
+  if (RARITY_TIERS.includes(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
 export async function listCards(limit = 20) {
   if (isWeb) {
     const cards = webStore.cards
@@ -1379,6 +1777,15 @@ export async function listCards(limit = 20) {
     });
   }
   return cards;
+}
+
+export async function countCards() {
+  if (isWeb) {
+    return webStore.cards.length;
+  }
+  const result = await execSql('SELECT COUNT(*) as count FROM cards');
+  if (result.rows.length === 0) return 0;
+  return result.rows.item(0).count || 0;
 }
 
 export async function listRecentEfforts({ limit = 5, habitId = null } = {}) {
@@ -1702,6 +2109,34 @@ export async function clearAllData() {
   await execSql('DELETE FROM identity');
 }
 
+export async function importAllDataSafe(payload, { requireNonEmpty = true } = {}) {
+  // Safe import: validate/decrypt before wipe to avoid data loss.
+  if (isEncryptedPayload(payload)) {
+    return {
+      ok: false,
+      reason: 'encrypted',
+      error: 'Backup appears encrypted. Decrypt before importing.',
+    };
+  }
+  const validation = validateBackupPayload(payload);
+  if (!validation.valid) {
+    return { ok: false, reason: 'invalid', error: validation.reason };
+  }
+  if (requireNonEmpty) {
+    const total = totalBackupCount(validation.counts);
+    if (total === 0) {
+      return {
+        ok: false,
+        reason: 'empty',
+        error: 'Backup payload is empty. Import cancelled to prevent data loss.',
+      };
+    }
+  }
+  await clearAllData(); // Only wipe after validation succeeds.
+  await importAllData(payload);
+  return { ok: true, counts: validation.counts };
+}
+
 export async function importAllData(payload) {
   if (!payload) return;
   const meta = payload.meta || null;
@@ -1733,13 +2168,15 @@ export async function importAllData(payload) {
 
   if (payload.identity) {
     await execSql(
-      'INSERT INTO identity (id, level, totalEffortUnits, createdAt, lastActiveAt) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO identity (id, level, totalEffortUnits, createdAt, lastActiveAt, orientationCompleted, equippedCardId) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [
         payload.identity.id,
         payload.identity.level,
         payload.identity.totalEffortUnits,
         payload.identity.createdAt,
         payload.identity.lastActiveAt,
+        payload.identity.orientationCompleted ? 1 : 0,
+        payload.identity.equippedCardId || null,
       ]
     );
   }
@@ -1819,8 +2256,16 @@ export async function importAllData(payload) {
 
   for (const arc of payload.arcQuestProgress || []) {
     await execSql(
-      'INSERT INTO arc_quest_progress (arcId, progress, unlockedCount, updatedAt) VALUES (?, ?, ?, ?)',
-      [arc.arcId, arc.progress, arc.unlockedCount || 0, arc.updatedAt || nowIso()]
+      'INSERT INTO arc_quest_progress (arcId, progress, unlockedCount, accepted, ignored, habitId, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [
+        arc.arcId,
+        arc.progress,
+        arc.unlockedCount || 0,
+        arc.accepted ? 1 : 0,
+        arc.ignored ? 1 : 0,
+        arc.habitId || null,
+        arc.updatedAt || nowIso(),
+      ]
     );
   }
 

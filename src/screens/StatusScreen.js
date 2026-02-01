@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { StyleSheet, Text, View, Pressable, TextInput, ScrollView, Platform, Image } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { ADMIN_EMAILS, TURNSTILE_SITE_KEY, isAdminEmail } from '../config';
+import { ADMIN_EMAILS, TURNSTILE_SITE_KEY, TURNSTILE_VERIFY_URL, isAdminEmail } from '../config';
 import { supabase } from '../services/supabase';
 import {
   signInWithPassword,
@@ -50,6 +50,15 @@ import {
   setHabitActive,
   getHabitEffortForName,
   deleteHabit,
+  acceptArcQuest,
+  ignoreArcQuest,
+  bindArcQuestToHabit,
+  markOrientationComplete,
+  adminSpawnChest,
+  adminOpenChest,
+  adminUnlockAllChestRewards,
+  adminGrantCard,
+  getEquippedCardId,
 } from '../db/db';
 
 const TOP_BAR_HEIGHT = Platform.OS === 'web' ? 80 : 88;
@@ -68,6 +77,8 @@ const ACCENT_GOLD = '#f6c46a';
 const ENCRYPTION_VERSION = 1;
 const TURNSTILE_SCRIPT_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
 const BACKUP_HISTORY_KEY = 'lifemaxing.backupHistory.v1';
+const ADMIN_TOOL_RARITIES = ['common', 'uncommon', 'rare', 'epic', 'relic'];
+const ADMIN_TOOL_TIERS = ['weathered', 'sealed', 'engraved', 'runed', 'ancient'];
 
 function TurnstileWidget({ onToken, onError }) {
   const containerRef = useRef(null);
@@ -314,8 +325,60 @@ export default function StatusScreen() {
   const [activeTab, setActiveTab] = useState('Tasks');
   const [rlsMessage, setRlsMessage] = useState('');
   const [backupPassphrase, setBackupPassphrase] = useState('');
-  const [turnstileToken, setTurnstileToken] = useState('');
-  const [turnstileMessage, setTurnstileMessage] = useState('');
+const [turnstileToken, setTurnstileToken] = useState('');
+const [turnstileMessage, setTurnstileMessage] = useState('');
+  const [orientationAccepted, setOrientationAccepted] = useState(false);
+  const [orientationIgnored, setOrientationIgnored] = useState(false);
+  const [orientationMessage, setOrientationMessage] = useState('');
+  const [showAdminTools, setShowAdminTools] = useState(false);
+  const [adminToolRarity, setAdminToolRarity] = useState('common');
+  const [adminToolTier, setAdminToolTier] = useState('weathered');
+  const [adminToolQuantity, setAdminToolQuantity] = useState('1');
+  const [adminToolForcedRewards, setAdminToolForcedRewards] = useState('');
+  const [adminToolMessage, setAdminToolMessage] = useState('');
+  const [adminToolChests, setAdminToolChests] = useState([]);
+  const [adminToolBusy, setAdminToolBusy] = useState(false);
+  const [adminToolCardKey, setAdminToolCardKey] = useState('');
+  const [adminToolCardQuantity, setAdminToolCardQuantity] = useState('1');
+  const [adminToolNotice, setAdminToolNotice] = useState('');
+  const [equippedCardId, setEquippedCardId] = useState(null);
+
+  const TASK_SECTIONS = [
+    { key: 'status', label: 'STATUS' },
+    { key: 'quests', label: 'QUESTS' },
+    { key: 'skills', label: 'SKILLS' },
+    { key: 'equip', label: 'EQUIP' },
+  ];
+  const TASK_SECTION_KEY = 'lifemaxing.activeTaskSection.v1';
+  const [activeTaskSection, setActiveTaskSection] = useState(TASK_SECTIONS[0].key);
+
+  useEffect(() => {
+    let alive = true;
+    async function restoreSection() {
+      try {
+        const stored = await AsyncStorage.getItem(TASK_SECTION_KEY);
+        if (!alive || !stored) return;
+        if (TASK_SECTIONS.some((section) => section.key === stored)) {
+          setActiveTaskSection(stored);
+        }
+      } catch (error) {
+        // ignore
+      }
+    }
+    restoreSection();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  async function handleTaskSectionChange(key) {
+    setActiveTaskSection(key);
+    try {
+      await AsyncStorage.setItem(TASK_SECTION_KEY, key);
+    } catch (error) {
+      // ignore
+    }
+  }
 
   const adminEnabled = ADMIN_EMAILS.length > 0;
   const authEnabled = !!supabase;
@@ -336,7 +399,6 @@ export default function StatusScreen() {
     const chestList = await listChests(5);
     const itemList = await listItems(20);
     const cardList = await listCards(20);
-    const arcQuestList = await listArcQuestStatus();
     const effortList = await listRecentEfforts({
       limit: 6,
       habitId: effortFilter === 'all' ? null : effortFilter,
@@ -353,21 +415,63 @@ export default function StatusScreen() {
     setEfforts(effortList);
     setEvidence(evidenceSummary);
     setCombatChest(latestChest);
-    setArcQuests(arcQuestList);
-    if (habitList.length > 0) {
-      const effortEntries = await Promise.all(
-        habitList.map(async (habit) => {
-          const info = await getHabitEffortForName(habit.name);
-          return [habit.id, info];
-        })
-      );
-      setHabitEfforts(Object.fromEntries(effortEntries));
-    } else {
-      setHabitEfforts({});
+    const currentEquipped = await getEquippedCardId();
+    setEquippedCardId(currentEquipped);
+      await refreshArcQuests();
+      if (habitList.length > 0) {
+        const effortEntries = await Promise.all(
+          habitList.map(async (habit) => {
+            const info = await getHabitEffortForName(habit.name);
+            return [habit.id, info];
+          })
+        );
+        setHabitEfforts(Object.fromEntries(effortEntries));
+      } else {
+        setHabitEfforts({});
+      }
+      if (!habitId && habitList.length > 0) {
+        const active = habitList.find((habit) => habit.isActive);
+        setHabitId(active ? active.id : habitList[0].id);
+      }
     }
-    if (!habitId && habitList.length > 0) {
-      const active = habitList.find((habit) => habit.isActive);
-      setHabitId(active ? active.id : habitList[0].id);
+
+  async function refreshArcQuests() {
+    try {
+      const arcQuestList = await listArcQuestStatus();
+      setArcQuests(arcQuestList);
+    } catch (error) {
+      console.error('Failed to refresh arc quests', error);
+    }
+  }
+
+  async function handleAcceptArc(arcId) {
+    try {
+      await acceptArcQuest(arcId);
+      await refreshArcQuests();
+    } catch (error) {
+      console.error('Failed to accept arc quest', error);
+    }
+  }
+
+  async function handleIgnoreArc(arcId) {
+    try {
+      await ignoreArcQuest(arcId);
+      await refreshArcQuests();
+    } catch (error) {
+      console.error('Failed to ignore arc quest', error);
+    }
+  }
+
+  async function handleCycleArcHabit(arc) {
+    if (habits.length === 0) return;
+    try {
+      const nextIndex = habits.findIndex((habit) => habit.id === arc.habitId) + 1;
+      const targetIndex = nextIndex < habits.length ? nextIndex : -1;
+      const nextHabitId = targetIndex === -1 ? null : habits[targetIndex].id;
+      await bindArcQuestToHabit(arc.id, nextHabitId);
+      await refreshArcQuests();
+    } catch (error) {
+      console.error('Failed to bind arc quest', error);
     }
   }
 
@@ -476,6 +580,31 @@ export default function StatusScreen() {
     [habits, habitId]
   );
 
+  const habitById = useMemo(
+    () => new Map(habits.map((habit) => [habit.id, habit])),
+    [habits]
+  );
+  const equippedCard = useMemo(
+    () => cards.find((card) => card.id === equippedCardId) || null,
+    [cards, equippedCardId]
+  );
+
+  const orientationIdentity = snapshot?.identity;
+  const shouldShowOrientation = Boolean(
+    orientationIdentity &&
+      (orientationIdentity.totalEffortUnits || 0) === 0 &&
+      !orientationIdentity.orientationCompleted &&
+      !orientationIgnored
+  );
+  useEffect(() => {
+    if (shouldShowOrientation) {
+      setOrientationMessage('');
+    } else {
+      setOrientationAccepted(false);
+      setOrientationIgnored(false);
+    }
+  }, [shouldShowOrientation]);
+
   useEffect(() => {
     refresh();
   }, [effortFilter]);
@@ -540,6 +669,33 @@ export default function StatusScreen() {
     return false;
   }
 
+  async function verifyTurnstileToken(action) {
+    // Server-side verification is required to prevent bypass of client-only checks.
+    if (!turnstileEnabled) return { ok: true };
+    if (!TURNSTILE_VERIFY_URL) {
+      return { ok: false, message: 'Turnstile verification endpoint is not configured.' };
+    }
+    if (!turnstileToken) {
+      return { ok: false, message: 'Complete the Turnstile check to continue.' };
+    }
+    try {
+      const response = await fetch(TURNSTILE_VERIFY_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: turnstileToken, action }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.success) {
+        return {
+          ok: false,
+          message: data.error || 'Turnstile verification failed. Try again.',
+        };
+      }
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, message: 'Turnstile verification failed. Try again.' };
+    }
+  }
   async function encryptIfNeeded(payload) {
     if (!hasPassphrase) return payload;
     if (Platform.OS !== 'web') {
@@ -710,6 +866,127 @@ export default function StatusScreen() {
     return new Date(Math.max(...candidates.map((date) => date.getTime())));
   }
 
+  function handleAcceptOrientation() {
+    setOrientationAccepted(true);
+    setOrientationIgnored(false);
+  }
+
+  function handleIgnoreOrientation() {
+    setOrientationIgnored(true);
+    setOrientationAccepted(false);
+  }
+
+  async function handleAdminSpawnChest(best = false) {
+    if (adminToolBusy) return;
+    const selectedRarity = best ? 'relic' : adminToolRarity;
+    const selectedTier = best ? 'ancient' : adminToolTier;
+    const quantity = Math.max(1, Math.min(10, Number.parseInt(adminToolQuantity, 10) || 1));
+    let parsedForced = null;
+    if (adminToolForcedRewards.trim()) {
+      try {
+        const parsed = JSON.parse(adminToolForcedRewards);
+        if (!Array.isArray(parsed)) {
+          throw new Error('Forced rewards must be an array.');
+        }
+        parsedForced = parsed;
+      } catch (error) {
+        setAdminToolMessage(error?.message || 'Invalid forced rewards configuration.');
+        return;
+      }
+    }
+    setAdminToolBusy(true);
+    setAdminToolMessage('');
+    try {
+      const spawned = await adminSpawnChest({
+        rarity: selectedRarity,
+        tier: selectedTier,
+        qty: quantity,
+        forcedRewards: parsedForced,
+      });
+      setAdminToolChests((prev) => [...spawned, ...prev].slice(0, 5));
+      setAdminToolMessage(`Spawned ${spawned.length} chest${spawned.length === 1 ? '' : 's'}.`);
+      if (best) {
+        setAdminToolRarity('relic');
+        setAdminToolTier('ancient');
+      }
+      await refresh();
+    } catch (error) {
+      setAdminToolMessage(error?.message || 'Failed to spawn chest.');
+    } finally {
+      setAdminToolBusy(false);
+    }
+  }
+
+  async function handleOpenAdminChest(chestId) {
+    if (adminToolBusy) return;
+    setAdminToolBusy(true);
+    try {
+      const chest = await adminOpenChest({ chestId });
+      setAdminToolChests((prev) =>
+        prev.map((entry) =>
+          entry.id === chestId
+            ? { ...entry, rewards: chest.rewards, lockedCount: chest.lockedCount }
+            : entry
+        )
+      );
+      setAdminToolMessage(`Loaded ${chest.rewards.length} reward${chest.rewards.length === 1 ? '' : 's'}.`);
+    } catch (error) {
+      setAdminToolMessage(error?.message || 'Failed to open chest.');
+    } finally {
+      setAdminToolBusy(false);
+    }
+  }
+
+  async function handleUnlockAdminChest(chestId) {
+    if (adminToolBusy) return;
+    setAdminToolBusy(true);
+    try {
+      const chest = await adminUnlockAllChestRewards({ chestId });
+      setAdminToolChests((prev) =>
+        prev.map((entry) =>
+          entry.id === chestId
+            ? {
+                ...entry,
+                rewards: chest.rewards,
+                lockedCount: 0,
+                unlockedRewardCount: chest.rewardCount,
+              }
+            : entry
+        )
+      );
+      setAdminToolMessage('Chest unlocked.');
+      await refresh();
+    } catch (error) {
+      setAdminToolMessage(error?.message || 'Failed to unlock chest.');
+    } finally {
+      setAdminToolBusy(false);
+    }
+  }
+
+  async function handleGrantAdminCard() {
+    if (adminToolBusy) return;
+    setAdminToolBusy(true);
+    setAdminToolNotice('');
+    try {
+      const qty = Math.max(1, Math.min(10, Number.parseInt(adminToolCardQuantity, 10) || 1));
+      const key = adminToolCardKey.trim() || 'return_signal';
+      const result = await adminGrantCard({ cardKey: key, qty });
+      let notice = `Granted ${result.grantedCount} card${result.grantedCount === 1 ? '' : 's'}.`;
+      if (result.autoEquippedCardId) {
+        notice += ' Auto-equipped.';
+      } else if (result.totalOwned >= 2) {
+        notice += ' Auto-equip paused (>=2 cards).';
+      }
+      setAdminToolNotice(notice);
+      setAdminToolMessage('Card grant applied.');
+      await refresh();
+    } catch (error) {
+      setAdminToolMessage(error?.message || 'Failed to grant card.');
+    } finally {
+      setAdminToolBusy(false);
+    }
+  }
+
   async function handleLogEffort(customHabitId, customHabitName) {
     const targetHabitId = customHabitId || habitId;
     if (!targetHabitId) return;
@@ -720,11 +997,15 @@ export default function StatusScreen() {
       return;
     }
     const cleanedNote = effortNote.trim();
-    const result = await logEffort({
-      habitId: targetHabitId,
-      note: cleanedNote.length ? cleanedNote : null,
-    });
-    await refresh();
+      const result = await logEffort({
+        habitId: targetHabitId,
+        note: cleanedNote.length ? cleanedNote : null,
+      });
+      if (shouldShowOrientation) {
+        await markOrientationComplete();
+      setOrientationMessage('You logged effort. That\'s all this system ever asks.');
+      }
+      await refresh();
     setEffortNote('');
     if (result?.arcUnlocks?.length) {
       setArcOverlay(result.arcUnlocks[0]);
@@ -783,6 +1064,11 @@ export default function StatusScreen() {
       return;
     }
     setTurnstileMessage('');
+    const verification = await verifyTurnstileToken('signin');
+    if (!verification.ok) {
+      setTurnstileMessage(verification.message);
+      return;
+    }
     setAdminBusy(true);
     setAccountMessage('');
     setAdminMessage('');
@@ -1514,6 +1800,11 @@ export default function StatusScreen() {
       return;
     }
     setTurnstileMessage('');
+    const verification = await verifyTurnstileToken('signup');
+    if (!verification.ok) {
+      setTurnstileMessage(verification.message);
+      return;
+    }
     setAdminBusy(true);
     setAccountMessage('');
     setAdminMessage('');
@@ -1792,11 +2083,233 @@ export default function StatusScreen() {
               <Text style={styles.subtle}>Future: shared metrics + sync.</Text>
             </>
           ) : null}
+          </View>
+      ) : null}
+
+      {showTasks && adminStatus === 'signed_in' && adminClaim ? (
+        <View style={styles.panel}>
+          <View style={styles.adminToolsHeader}>
+            <Text style={styles.panelTitle}>Admin Tools</Text>
+            <Pressable
+              style={styles.buttonGhost}
+              onPress={() => setShowAdminTools((prev) => !prev)}
+            >
+              <Text style={styles.buttonGhostText}>
+                {showAdminTools ? 'Hide tools' : 'Open admin tools'}
+              </Text>
+            </Pressable>
+          </View>
+          {adminToolMessage ? (
+            <Text style={styles.adminToolsMessage}>{adminToolMessage}</Text>
+          ) : null}
+          {!showAdminTools ? (
+            <Text style={styles.subtle}>Tap to open the admin console.</Text>
+          ) : (
+            <>
+              <View style={styles.adminToolsMetaRow}>
+                <Text style={styles.subtle}>
+                  Equipped card: {equippedCard?.name || equippedCardId || 'None yet'}
+                </Text>
+                <Text style={styles.subtle}>Cards shown: {cards.length}</Text>
+              </View>
+              <Text style={styles.panelSubtitle}>Chest Spawner</Text>
+              <View style={styles.adminToolsRow}>
+                {ADMIN_TOOL_RARITIES.map((option) => {
+                  const active = option === adminToolRarity;
+                  return (
+                    <Pressable
+                      key={option}
+                      style={[styles.adminToolsChip, active && styles.adminToolsChipActive]}
+                      onPress={() => setAdminToolRarity(option)}
+                    >
+                      <Text
+                        style={[
+                          styles.adminToolsChipText,
+                          active && styles.adminToolsChipTextActive,
+                        ]}
+                      >
+                        {option.toUpperCase()}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <View style={styles.adminToolsRow}>
+                {ADMIN_TOOL_TIERS.map((option) => {
+                  const active = option === adminToolTier;
+                  return (
+                    <Pressable
+                      key={option}
+                      style={[styles.adminToolsChip, active && styles.adminToolsChipActive]}
+                      onPress={() => setAdminToolTier(option)}
+                    >
+                      <Text
+                        style={[
+                          styles.adminToolsChipText,
+                          active && styles.adminToolsChipTextActive,
+                        ]}
+                      >
+                        {option}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <View style={styles.adminToolsRow}>
+                <TextInput
+                  style={styles.adminToolsInput}
+                  value={adminToolQuantity}
+                  onChangeText={setAdminToolQuantity}
+                  keyboardType="number-pad"
+                  placeholder="Quantity"
+                  editable={!adminToolBusy}
+                />
+              </View>
+              <View style={styles.adminToolsRow}>
+                <TextInput
+                  style={[styles.adminToolsInput, styles.adminToolsTextArea]}
+                  value={adminToolForcedRewards}
+                  onChangeText={setAdminToolForcedRewards}
+                  placeholder='Forced rewards JSON (optional)'
+                  multiline
+                  editable={!adminToolBusy}
+                />
+              </View>
+              <View style={styles.adminToolsButtonRow}>
+                <Pressable
+                  style={[styles.button, adminToolBusy && styles.buttonDisabled]}
+                  onPress={() => handleAdminSpawnChest(false)}
+                  disabled={adminToolBusy}
+                >
+                  <Text style={styles.buttonText}>Spawn Chest</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.buttonGhost, adminToolBusy && styles.buttonDisabled]}
+                  onPress={() => handleAdminSpawnChest(true)}
+                  disabled={adminToolBusy}
+                >
+                  <Text style={styles.buttonGhostText}>Spawn Best Chest</Text>
+                </Pressable>
+              </View>
+              <Text style={styles.panelSubtitle}>Chest List</Text>
+              {adminToolChests.length === 0 ? (
+                <Text style={styles.subtle}>Spawned chests appear here.</Text>
+              ) : (
+                adminToolChests.map((chest) => (
+                  <View key={chest.id} style={styles.adminToolsChest}>
+                    <View style={styles.adminToolsChestHeader}>
+                      <Text style={styles.adminToolsChestTitle}>
+                        {chest.rarity} / {chest.tier || 'weathered'}
+                      </Text>
+                      <Text style={styles.subtle}>
+                        Rewards {chest.rewardCount} (locked {chest.lockedCount})
+                      </Text>
+                    </View>
+                    <View style={styles.adminToolsChestActions}>
+                      <Pressable
+                        style={[
+                          styles.buttonSmall,
+                          styles.buttonGhost,
+                          adminToolBusy && styles.buttonDisabled,
+                          { marginRight: 8 },
+                        ]}
+                        onPress={() => handleOpenAdminChest(chest.id)}
+                        disabled={adminToolBusy}
+                      >
+                        <Text style={styles.buttonGhostText}>Open</Text>
+                      </Pressable>
+                      <Pressable
+                        style={[
+                          styles.buttonSmall,
+                          styles.buttonGhost,
+                          adminToolBusy && styles.buttonDisabled,
+                          { marginRight: 0 },
+                        ]}
+                        onPress={() => handleUnlockAdminChest(chest.id)}
+                        disabled={adminToolBusy}
+                      >
+                        <Text style={styles.buttonGhostText}>Unlock All</Text>
+                      </Pressable>
+                    </View>
+                    {chest.rewards &&
+                      chest.rewards.map((reward) => (
+                        <View key={reward.id} style={styles.adminToolsRewardRow}>
+                          <Text style={styles.adminToolsRewardText}>
+                            {reward.name} [{reward.type}] {reward.locked ? '(locked)' : '(unlocked)'}
+                          </Text>
+                        </View>
+                      ))}
+                  </View>
+                ))
+              )}
+              <Text style={styles.panelSubtitle}>Card Grants</Text>
+              <View style={styles.adminToolsRow}>
+                <TextInput
+                  style={styles.adminToolsInput}
+                  value={adminToolCardKey}
+                  onChangeText={setAdminToolCardKey}
+                  placeholder="Card key (e.g. return_signal)"
+                  autoCapitalize="none"
+                  editable={!adminToolBusy}
+                />
+              </View>
+              <View style={styles.adminToolsRow}>
+                <TextInput
+                  style={styles.adminToolsInput}
+                  value={adminToolCardQuantity}
+                  onChangeText={setAdminToolCardQuantity}
+                  keyboardType="number-pad"
+                  placeholder="Qty"
+                  editable={!adminToolBusy}
+                />
+              </View>
+              <Pressable
+                style={[styles.button, adminToolBusy && styles.buttonDisabled]}
+                onPress={handleGrantAdminCard}
+                disabled={adminToolBusy}
+              >
+                <Text style={styles.buttonText}>Grant Card</Text>
+              </Pressable>
+              {adminToolNotice ? (
+                <Text style={styles.adminToolsNotice}>{adminToolNotice}</Text>
+              ) : null}
+            </>
+          )}
         </View>
       ) : null}
 
       {showTasks ? (
         <View style={styles.panel}>
+          <View
+            style={styles.taskNav}
+            accessibilityRole="tablist"
+            accessibilityLabel="Task sections"
+          >
+            {TASK_SECTIONS.map((section) => {
+              const isActive = activeTaskSection === section.key;
+              return (
+                <Pressable
+                  key={section.key}
+                  style={[
+                    styles.taskButton,
+                    isActive && styles.taskButtonActive,
+                  ]}
+                  onPress={() => handleTaskSectionChange(section.key)}
+                  accessibilityRole="tab"
+                  accessibilityState={{ selected: isActive }}
+                >
+                  <Text
+                    style={[
+                      styles.taskButtonText,
+                      isActive && styles.taskButtonTextActive,
+                    ]}
+                  >
+                    {section.label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
           <Text style={styles.panelTitle}>Status</Text>
           <View style={styles.heroRow}>
             <View style={styles.avatarBox}>
@@ -1898,38 +2411,123 @@ export default function StatusScreen() {
         </View>
       ) : null}
 
-      {showTasks ? (
-        <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Arc Quests</Text>
-          {arcQuests.length === 0 ? (
-            <Text style={styles.subtle}>Arc quests appear quietly over time.</Text>
-          ) : (
-            <View style={styles.arcList}>
-              {arcQuests.map((quest) => (
-                <View key={quest.id} style={styles.arcCard}>
-                  <View style={styles.arcHeader}>
-                    <Text style={styles.arcTitle}>{quest.title}</Text>
-                    <Text style={styles.arcTheme}>{quest.theme}</Text>
-                  </View>
-                  <Text style={styles.subtle}>{quest.summary}</Text>
-                  <View style={styles.arcProgressRow}>
-                    <Text style={styles.arcProgressValue}>{quest.progress} effort</Text>
-                    <Text style={styles.arcProgressMeta}>
-                      {quest.unlockedCount}/{quest.totalFragments} fragments
+        {showTasks ? (
+          <View style={styles.panel}>
+            {shouldShowOrientation && (
+              <View style={styles.orientationPanel}>
+                <Text style={styles.panelTitle}>Take the First Step</Text>
+                <Text style={styles.orientationSubtitle}>Every system begins with a single signal.</Text>
+                <Text style={styles.orientationObjective}>Objective: Log any effort once.</Text>
+                <Text style={styles.subtle}>
+                  This is enough for now. Action first, explanation later.
+                </Text>
+                <View style={styles.orientationActions}>
+                  <Pressable
+                    style={[
+                      styles.buttonSmall,
+                      styles.orientationActionButton,
+                      orientationAccepted && styles.buttonDisabled,
+                    ]}
+                    onPress={handleAcceptOrientation}
+                    disabled={orientationAccepted}
+                  >
+                    <Text style={styles.buttonText}>
+                      {orientationAccepted ? 'Quest accepted' : 'Accept quest'}
                     </Text>
-                  </View>
-                  {quest.nextMilestone ? (
-                    <Text style={styles.arcProgressMeta}>
-                      Next fragment at {quest.nextMilestone} effort
-                    </Text>
-                  ) : (
-                    <Text style={styles.arcProgressMeta}>All fragments unlocked.</Text>
-                  )}
+                  </Pressable>
+                  <Pressable
+                    style={[styles.buttonGhost, styles.orientationIgnore]}
+                    onPress={handleIgnoreOrientation}
+                  >
+                    <Text style={styles.buttonGhostText}>Ignore for now</Text>
+                  </Pressable>
                 </View>
-              ))}
-            </View>
-          )}
-        </View>
+              </View>
+            )}
+            {orientationMessage ? (
+              <View style={styles.orientationMessage}>
+                <Text style={styles.orientationMessageText}>{orientationMessage}</Text>
+              </View>
+            ) : null}
+            <Text style={styles.panelTitle}>Arc Quests</Text>
+            {arcQuests.length === 0 ? (
+              <Text style={styles.subtle}>Arc quests appear quietly over time.</Text>
+            ) : (
+              <View style={styles.arcList}>
+                {arcQuests.map((quest) => {
+                  const linkedHabit = habitById.get(quest.habitId);
+                  return (
+                    <View key={quest.id} style={styles.arcCard}>
+                      <View style={styles.arcHeader}>
+                        <Text style={styles.arcTitle}>{quest.title}</Text>
+                        <Text style={styles.arcTheme}>{quest.theme}</Text>
+                      </View>
+                      <Text style={styles.subtle}>{quest.summary}</Text>
+                      <View style={styles.arcProgressRow}>
+                        <Text style={styles.arcProgressValue}>{quest.progress} effort</Text>
+                        <Text style={styles.arcProgressMeta}>
+                          {quest.unlockedCount}/{quest.totalFragments} fragments
+                        </Text>
+                      </View>
+                      {quest.nextMilestone ? (
+                        <Text style={styles.arcProgressMeta}>
+                          Next fragment at {quest.nextMilestone} effort
+                        </Text>
+                      ) : (
+                        <Text style={styles.arcProgressMeta}>All fragments unlocked.</Text>
+                      )}
+                      <View style={styles.arcControlRow}>
+                        <Text style={styles.arcHint}>
+                          Arc quests describe your journey—they never demand a daily task.
+                        </Text>
+                        {!quest.accepted && (
+                          <View style={styles.arcButtonRow}>
+                            <Pressable
+                              style={[styles.buttonSmall, styles.arcAcceptButton]}
+                              onPress={() => handleAcceptArc(quest.id)}
+                            >
+                              <Text style={styles.buttonText}>Accept quest</Text>
+                            </Pressable>
+                            {!quest.ignored && (
+                              <Pressable
+                                style={styles.buttonGhost}
+                                onPress={() => handleIgnoreArc(quest.id)}
+                              >
+                                <Text style={styles.buttonGhostText}>Ignore for now</Text>
+                              </Pressable>
+                            )}
+                          </View>
+                        )}
+                        {quest.accepted && (
+                          <View style={styles.arcLinkRow}>
+                            <Text style={styles.subtle}>
+                              Linked Habit:&nbsp;
+                              <Text style={{ color: ACCENT_GOLD }}>
+                                {linkedHabit ? linkedHabit.name : 'None yet'}
+                              </Text>
+                            </Text>
+                            <Pressable
+                              style={[styles.buttonSmall, styles.arcLinkButton]}
+                              onPress={() => handleCycleArcHabit(quest)}
+                            >
+                              <Text style={styles.buttonText}>
+                                {linkedHabit ? 'Rebind habit' : 'Bind a habit'}
+                              </Text>
+                            </Pressable>
+                          </View>
+                        )}
+                        {!quest.accepted && quest.ignored ? (
+                          <Text style={styles.quietText}>
+                            Ignored quietly—accept any time to re-open this narrative.
+                          </Text>
+                        ) : null}
+                      </View>
+                    </View>
+                  );
+                })}
+              </View>
+            )}
+          </View>
       ) : null}
 
       {showTasks && isQuietMode ? (
@@ -3155,6 +3753,34 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontWeight: '700',
   },
+  taskNav: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginBottom: 12,
+  },
+  taskButton: {
+    borderWidth: 1,
+    borderColor: '#2b4e82',
+    borderRadius: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: '#0f1a35',
+  },
+  taskButtonActive: {
+    borderColor: '#7bc7ff',
+    backgroundColor: '#12315a',
+  },
+  taskButtonText: {
+    color: '#c7e2ff',
+    fontSize: FONT.sm,
+    letterSpacing: 1.2,
+    textTransform: 'uppercase',
+  },
+  taskButtonTextActive: {
+    color: '#ffffff',
+    fontWeight: '700',
+  },
   layout: {
     flex: 1,
     flexDirection: 'row',
@@ -3265,6 +3891,81 @@ const styles = StyleSheet.create({
   arcProgressMeta: {
     color: '#9bb3d6',
     fontSize: FONT.sm,
+  },
+  arcControlRow: {
+    marginTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#132248',
+    paddingTop: 10,
+    gap: 6,
+  },
+  arcHint: {
+    color: '#9bb3d6',
+    fontSize: FONT.sm,
+  },
+  arcButtonRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 6,
+  },
+  arcAcceptButton: {
+    borderColor: '#6fd0ff',
+    backgroundColor: '#122444',
+  },
+  arcLinkRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 6,
+    gap: 8,
+  },
+  arcLinkButton: {
+    borderColor: '#7bc7ff',
+    backgroundColor: '#0c1732',
+  },
+  orientationPanel: {
+    borderWidth: 1,
+    borderColor: '#6fd0ff',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 14,
+    backgroundColor: '#0a1a33',
+  },
+  orientationSubtitle: {
+    color: '#9bb3d6',
+    fontSize: FONT.sm,
+    marginBottom: 6,
+  },
+  orientationObjective: {
+    color: '#eaf4ff',
+    fontSize: FONT.lg,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  orientationActions: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 8,
+  },
+  orientationActionButton: {
+    borderColor: '#2fa4ff',
+    backgroundColor: '#12223c',
+  },
+  orientationIgnore: {
+    marginTop: 0,
+  },
+  orientationMessage: {
+    borderWidth: 1,
+    borderColor: '#7bc7ff',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 14,
+    backgroundColor: '#0b1630',
+  },
+  orientationMessageText: {
+    color: '#eaf4ff',
+    fontSize: FONT.md,
   },
   arcOverlay: {
     position: 'absolute',
@@ -3873,6 +4574,117 @@ const styles = StyleSheet.create({
     color: '#c7e2ff',
     fontWeight: '700',
     fontSize: 14,
+  },
+  adminToolsHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  adminToolsMessage: {
+    color: '#ffe4a3',
+    fontSize: FONT.xs,
+    marginBottom: 6,
+  },
+  panelSubtitle: {
+    color: '#ffffff',
+    fontSize: FONT.md,
+    fontWeight: '600',
+    marginTop: 8,
+    marginBottom: 6,
+    letterSpacing: 0.4,
+  },
+  adminToolsMetaRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    flexWrap: 'wrap',
+    marginBottom: 8,
+  },
+  adminToolsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginBottom: 8,
+  },
+  adminToolsChip: {
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    backgroundColor: '#0a152c',
+    marginRight: 8,
+    marginBottom: 6,
+  },
+  adminToolsChipActive: {
+    borderColor: ACCENT_GOLD,
+    backgroundColor: '#14234c',
+  },
+  adminToolsChipText: {
+    fontSize: FONT.xs,
+    color: '#c7e2ff',
+    letterSpacing: 0.6,
+  },
+  adminToolsChipTextActive: {
+    color: '#fff7d1',
+  },
+  adminToolsInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    color: '#eaf4ff',
+    backgroundColor: '#0a152c',
+    marginRight: 8,
+  },
+  adminToolsTextArea: {
+    height: 80,
+    textAlignVertical: 'top',
+    marginRight: 0,
+    flexBasis: '100%',
+  },
+  adminToolsButtonRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginVertical: 12,
+  },
+  adminToolsChest: {
+    borderWidth: 1,
+    borderColor: '#1f335f',
+    borderRadius: 10,
+    padding: 10,
+    backgroundColor: '#08152e',
+    marginBottom: 10,
+  },
+  adminToolsChestHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  adminToolsChestTitle: {
+    color: '#ffe5a6',
+    fontSize: FONT.sm,
+    fontWeight: '700',
+  },
+  adminToolsChestActions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginBottom: 6,
+  },
+  adminToolsRewardRow: {
+    paddingVertical: 4,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderColor: '#1b2b4f',
+  },
+  adminToolsRewardText: {
+    color: '#9fd6ff',
+    fontSize: FONT.xs,
+  },
+  adminToolsNotice: {
+    color: ACCENT_GOLD,
+    fontSize: FONT.sm,
+    marginTop: 6,
   },
   grid: {
     flexDirection: 'row',

@@ -19,6 +19,7 @@ const POSTHOG_API_KEY = process.env.EXPO_PUBLIC_POSTHOG_API_KEY || '';
 const POSTHOG_HOST = process.env.EXPO_PUBLIC_POSTHOG_HOST || '';
 
 const TURNSTILE_SITE_KEY = process.env.EXPO_PUBLIC_TURNSTILE_SITE_KEY || '';
+const TURNSTILE_VERIFY_URL = process.env.EXPO_PUBLIC_TURNSTILE_VERIFY_URL || '';
 
 
 function isAdminEmail(email) {
@@ -35,5 +36,6 @@ export {
   POSTHOG_API_KEY,
   POSTHOG_HOST,
   TURNSTILE_SITE_KEY,
+  TURNSTILE_VERIFY_URL,
   isAdminEmail,
 };

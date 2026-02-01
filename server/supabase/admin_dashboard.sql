@@ -62,7 +62,7 @@ create policy "Admins can view profiles"
   on public.lifemaxing_user_profiles
   for select
   to authenticated
-  using ((auth.jwt() ->> 'is_admin') = 'true');
+  using ((auth.jwt() -> 'app_metadata' ->> 'is_admin') = 'true');
 
 create policy "Users can upsert their summary"
   on public.lifemaxing_backup_summary
@@ -80,7 +80,7 @@ create policy "Admins can view summaries"
   on public.lifemaxing_backup_summary
   for select
   to authenticated
-  using ((auth.jwt() ->> 'is_admin') = 'true');
+  using ((auth.jwt() -> 'app_metadata' ->> 'is_admin') = 'true');
 
 create policy "Users can insert system events"
   on public.lifemaxing_system_events
@@ -92,16 +92,16 @@ create policy "Admins can view system events"
   on public.lifemaxing_system_events
   for select
   to authenticated
-  using ((auth.jwt() ->> 'is_admin') = 'true');
+  using ((auth.jwt() -> 'app_metadata' ->> 'is_admin') = 'true');
 
 create policy "Admins can insert audit events"
   on public.lifemaxing_admin_audit
   for insert
   to authenticated
-  with check ((auth.jwt() ->> 'is_admin') = 'true' and auth.uid() = admin_user_id);
+  with check ((auth.jwt() -> 'app_metadata' ->> 'is_admin') = 'true' and auth.uid() = admin_user_id);
 
 create policy "Admins can view audit events"
   on public.lifemaxing_admin_audit
   for select
   to authenticated
-  using ((auth.jwt() ->> 'is_admin') = 'true');
+  using ((auth.jwt() -> 'app_metadata' ->> 'is_admin') = 'true');

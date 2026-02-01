@@ -1,6 +1,5 @@
 import { supabase } from './supabase';
-import { isAdminEmail } from '../config';
-import { exportAllData, importAllData, clearAllData, touchLastActive } from '../db/db';
+import { exportAllData, importAllDataSafe, touchLastActive } from '../db/db';
 
 const BACKUP_TABLE = 'lifemaxing_backups';
 const BACKUP_HISTORY_TABLE = 'lifemaxing_backup_history';
@@ -25,8 +24,9 @@ async function requireSession() {
 
 async function requireAdminSession() {
   const session = await requireSession();
-  const email = session.user?.email || '';
-  if (!isAdminEmail(email)) {
+  // This is only a guard for UI workflows; the real enforcement is handled by RLS/SQL.
+  const claim = session.user?.app_metadata?.is_admin;
+  if (claim !== true) {
     throw new Error('Admin access only.');
   }
   return session;
@@ -137,8 +137,10 @@ export async function fetchBackupPayload() {
 
 export async function loadBackup() {
   const data = await fetchBackupPayload();
-  await clearAllData();
-  await importAllData(data.payload);
+  const result = await importAllDataSafe(data.payload); // Validate/decrypt before wiping local data.
+  if (!result.ok) {
+    throw new Error(result.error || 'Backup import failed.');
+  }
   await touchLastActive();
   return data;
 }
@@ -373,8 +375,10 @@ export async function fetchBackupForUserId(userId) {
 
 export async function loadBackupForUserId(userId) {
   const data = await fetchBackupForUserId(userId);
-  await clearAllData();
-  await importAllData(data.payload);
+  const result = await importAllDataSafe(data.payload); // Admin restore must be safe as well.
+  if (!result.ok) {
+    throw new Error(result.error || 'Backup import failed.');
+  }
   await touchLastActive();
   return data;
 }
