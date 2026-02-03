@@ -12,7 +12,11 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { TURNSTILE_SITE_KEY, TURNSTILE_VERIFY_URL, PHASE2_ENABLED } from '../config';
-import { supabase } from '../services/supabase';
+import { supabase, getIsAdmin } from '../services/supabase';
+import RitualOverlay from '../components/RitualOverlay';
+import SlideOverFullScreen from '../components/SlideOverFullScreen';
+import HabitSpaceOverlay from '../components/HabitSpaceOverlay';
+import AdminPanelWeb from '../admin/AdminPanelWeb';
 import {
   signInWithPassword,
   signUpWithPassword,
@@ -37,7 +41,7 @@ import {
 } from '../services/backup';
 import {
   createHabit,
-  createCombatEncounter,
+  createRitualOpening,
   clearAllData,
   getInactivityDays,
   getMercyStatus,
@@ -57,7 +61,7 @@ import {
   importAllData,
   touchLastActive,
   logEffort,
-  resolveCombatEncounter,
+  completeRitualOpening,
   setHabitActive,
   deleteHabit,
   acceptArcQuest,
@@ -105,6 +109,7 @@ const RARITY_COLORS = {
   epic: '#d3a6ff',
   relic: '#ffd36a',
 };
+
 
 function TurnstileWidget({ onToken, onError }) {
   const containerRef = useRef(null);
@@ -287,14 +292,13 @@ export default function StatusScreen() {
   const [cards, setCards] = useState([]);
   const [efforts, setEfforts] = useState([]);
   const [effortFilter, setEffortFilter] = useState('all');
-  const [habitLogNote, setHabitLogNote] = useState('');
   const [habitNotes, setHabitNotes] = useState({});
   const [expNotesEnabled, setExpNotesEnabled] = useState(false);
   const [expNoteMessage, setExpNoteMessage] = useState('');
   const [habitActionCounts, setHabitActionCounts] = useState({});
   const [evidence, setEvidence] = useState(null);
-  const [combatChest, setCombatChest] = useState(null);
-  const [combatMessage, setCombatMessage] = useState('');
+  const [ritualChest, setRitualChest] = useState(null);
+  const [ritualMessage, setRitualMessage] = useState('');
   const [mercyStatus, setMercyStatus] = useState(null);
   const [accountMessage, setAccountMessage] = useState('');
   const [showLoginForm, setShowLoginForm] = useState(false);
@@ -302,9 +306,8 @@ export default function StatusScreen() {
   const [loginPassword, setLoginPassword] = useState('');
   const [authStatus, setAuthStatus] = useState('unknown');
   const [authEmail, setAuthEmail] = useState('');
-  const [adminStatus, setAdminStatus] = useState('unknown');
   const [adminMessage, setAdminMessage] = useState('');
-  const [adminClaim, setAdminClaim] = useState(null);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [lastBackupAt, setLastBackupAt] = useState(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
@@ -354,6 +357,9 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   const [adminPaletteMessage, setAdminPaletteMessage] = useState('');
   const [adminPaletteBusy, setAdminPaletteBusy] = useState(false);
   const [adminPaletteParams, setAdminPaletteParams] = useState({});
+  const [habitSpaceOpen, setHabitSpaceOpen] = useState(false);
+  const [habitSpaceHabitId, setHabitSpaceHabitId] = useState(null);
+  const [adminPanelOpen, setAdminPanelOpen] = useState(false);
   const [adminSeasonLocks, setAdminSeasonLocks] = useState({});
   const [adminRevealedCards, setAdminRevealedCards] = useState({});
   const [adminPhaseOverride, setAdminPhaseOverride] = useState(null);
@@ -365,6 +371,14 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   const [habitDetailId, setHabitDetailId] = useState(null);
   const [showAllArcQuests, setShowAllArcQuests] = useState(false);
   const [chestNotice, setChestNotice] = useState(null);
+  const [ritualOverlayOpen, setRitualOverlayOpen] = useState(false);
+  const [ritualOverlayChest, setRitualOverlayChest] = useState(null);
+  const [ritualOverlayRewards, setRitualOverlayRewards] = useState([]);
+  const [mercyInfoOpen, setMercyInfoOpen] = useState(false);
+  const [tasksStatusOpen, setTasksStatusOpen] = useState(false);
+  const [tasksEvidenceOpen, setTasksEvidenceOpen] = useState(false);
+  const [tasksOrientationOpen, setTasksOrientationOpen] = useState(false);
+  const [tasksArcOpen, setTasksArcOpen] = useState(false);
   const phase2Active = adminPhaseOverride === null ? PHASE2_ENABLED : adminPhaseOverride === 'on';
   const BASE_TABS = useMemo(
     () => [
@@ -388,7 +402,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   // Task sub-tabs removed to keep navigation singular (global tabs only).
 
   const authEnabled = !!supabase;
-  const adminAvailable = authStatus === 'signed_in' && adminClaim === true;
+  const adminAvailable = isAdmin === true;
   const navTabs = BASE_TABS;
   const HELP_TABS = ['Account', 'Backups', 'Local', 'Onboarding', 'Trust'];
 
@@ -396,12 +410,13 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     const snap = await getStatusSnapshot();
     const days = await getInactivityDays();
     const mercy = await getMercyStatus(days);
-    const habitList = await listHabits();
+    const rawHabits = await listHabits();
+    const habitList = rawHabits.map(normalizeHabitForUI);
     const chestList = await listChests(5);
       const itemList = await listItems(20);
       const cardList = await listCards(phase2Active ? 200 : 20);
       const effortList = await listRecentEfforts({
-        limit: 6,
+        limit: 60,
         habitId: effortFilter === 'all' ? null : effortFilter,
       });
       const evidenceSummary = await getEvidenceSummary();
@@ -415,7 +430,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
       setCards(cardList);
       setEfforts(effortList);
       setEvidence(evidenceSummary);
-      setCombatChest(latestChest);
+      setRitualChest(latestChest);
       const currentEquipped = await getEquippedCardId();
       setEquippedCardId(currentEquipped);
       await refreshArcQuests();
@@ -501,8 +516,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     if (!authEnabled || !EMAIL_AUTH_ENABLED) {
       setAuthStatus('disabled');
       setAuthEmail('');
-      setAdminStatus('disabled');
-      setAdminClaim(null);
       setLastBackupAt(null);
       await refreshBackupHistory();
       if (Platform.OS === 'web' && !onboardingDismissed) {
@@ -517,8 +530,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     if (!data.session) {
       setAuthStatus('signed_out');
       setAuthEmail('');
-      setAdminStatus('signed_out');
-      setAdminClaim(null);
       setLastBackupAt(null);
       await refreshBackupHistory();
       if (Platform.OS === 'web' && !onboardingDismissed) {
@@ -528,12 +539,8 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
       return;
     }
     const sessionEmail = data.session.user?.email || '';
-    const claim = data.session.user?.app_metadata?.is_admin;
     setAuthStatus('signed_in');
     setAuthEmail(sessionEmail);
-    const isAdminClaim = typeof claim === 'boolean' ? claim : null;
-    setAdminClaim(isAdminClaim);
-    setAdminStatus(isAdminClaim ? 'signed_in' : 'signed_out');
     try {
       await upsertUserProfile({ email: sessionEmail });
     } catch (error) {
@@ -663,6 +670,26 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
       expNoteTimeoutRef.current = null;
     }
   }, []);
+  useEffect(() => {
+    let mounted = true;
+
+    async function checkAdmin() {
+      const ok = await getIsAdmin();
+      if (mounted) setIsAdmin(ok);
+    }
+
+    checkAdmin();
+
+    const { data: sub } =
+      supabase?.auth.onAuthStateChange(() => {
+        checkAdmin();
+      }) || {};
+
+    return () => {
+      mounted = false;
+      sub?.subscription?.unsubscribe?.();
+    };
+  }, []);
 
   const totalEffortUnits = snapshot?.identity?.totalEffortUnits || 0;
   const expProgress =
@@ -758,10 +785,10 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     [habits]
   );
   useEffect(() => {
-    if (habitDetailId && !habitById.has(habitDetailId)) {
-      setHabitDetailId(null);
+    if (habitSpaceHabitId && !habitById.has(habitSpaceHabitId)) {
+      closeHabitSpace();
     }
-  }, [habitDetailId, habitById]);
+  }, [habitSpaceHabitId, habitById]);
   const galleryCardStats = useMemo(() => {
     const counts = new Map();
     const latest = new Map();
@@ -1100,7 +1127,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
       setOrientationMessage("You logged an action. That's all this system ever asks.");
     }
     await refresh();
-    setHabitLogNote('');
     if (result?.arcUnlocks?.length) {
       setArcOverlay(result.arcUnlocks[0]);
     }
@@ -1143,21 +1169,51 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     });
   }
 
-  async function handleCombat(outcome) {
-    if (!combatChest) return;
-    const encounter = await createCombatEncounter(combatChest.id);
-    if (!encounter) return;
-    const result = await resolveCombatEncounter({
-      encounterId: encounter.id,
-      chestId: combatChest.id,
-      outcome,
+  async function handleRitualOpen(outcome) {
+    if (!ritualChest) return;
+    const opening = await createRitualOpening(ritualChest.id);
+    if (!opening) return;
+    const result = await completeRitualOpening({
+      openingId: opening.id,
+      chestId: ritualChest.id,
     });
     if (outcome === 'win') {
-      setCombatMessage(`Victory: unlocked ${result.unlocked} reward(s).`);
+      setRitualMessage('Chest opened.');
     } else {
-      setCombatMessage('No downside. Rewards remain locked.');
+      setRitualMessage('Chest closed. Rewards remain.');
     }
     await refresh();
+  }
+
+  async function handleOpenChest() {
+    // Ritual-only chest opening. No outcomes.
+    await handleRitualOpen('win');
+  }
+
+  async function handleOpenRitual(chestId) {
+    if (!chestId) return;
+    try {
+      await adminUnlockAllChestRewards({ chestId });
+      const chest = await adminOpenChest({ chestId });
+      setRitualOverlayChest(chest);
+      setRitualOverlayRewards(chest?.rewards || []);
+      setRitualOverlayOpen(true);
+    } catch (error) {
+      setRitualMessage(error?.message || 'Unable to open ritual.');
+    }
+  }
+
+  async function openLatestChest() {
+    if (!ritualChest?.id) return;
+    await adminUnlockAllChestRewards({
+      chestId: ritualChest.id,
+    });
+    const result = await adminOpenChest({
+      chestId: ritualChest.id,
+    });
+    setRitualOverlayChest(result || ritualChest);
+    setRitualOverlayRewards(result?.rewards || []);
+    setRitualOverlayOpen(true);
   }
 
   async function handleAccountSignIn() {
@@ -1408,7 +1464,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   }
 
   async function handleRefreshBackups() {
-    if (adminStatus !== 'signed_in') {
+    if (!adminAvailable) {
       setAdminMessage('Admin access only.');
       return;
     }
@@ -1435,7 +1491,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   }
 
   async function handlePreviewBackup() {
-    if (adminStatus !== 'signed_in') {
+    if (!adminAvailable) {
       setAdminMessage('Admin access only.');
       return;
     }
@@ -1492,7 +1548,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   }
 
   async function handleLoadBackupHistoryForUser() {
-    if (adminStatus !== 'signed_in') {
+    if (!adminAvailable) {
       setAdminMessage('Admin access only.');
       return;
     }
@@ -1605,7 +1661,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   }
 
   async function handleRefreshAdminOverview() {
-    if (adminStatus !== 'signed_in') return;
+    if (!adminAvailable) return;
     setAdminLoading(true);
     setAdminMessage('');
     try {
@@ -1656,7 +1712,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   }
 
   async function handleDeleteUserData(type) {
-    if (adminStatus !== 'signed_in') {
+    if (!adminAvailable) {
       setAdminMessage('Admin access only.');
       return;
     }
@@ -1702,7 +1758,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   }
 
   async function handleDeleteAllUserData() {
-    if (adminStatus !== 'signed_in') {
+    if (!adminAvailable) {
       setAdminMessage('Admin access only.');
       return;
     }
@@ -1741,7 +1797,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   }
 
   async function handleLoadBackupForUser() {
-    if (adminStatus !== 'signed_in') {
+    if (!adminAvailable) {
       setAdminMessage('Admin access only.');
       return;
     }
@@ -1781,7 +1837,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   }
 
   async function handleExportBackup() {
-    if (adminStatus !== 'signed_in') {
+    if (!adminAvailable) {
       setAdminMessage('Admin access only.');
       return;
     }
@@ -1830,25 +1886,40 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
   }
 
+  function normalizeHabitForUI(h) {
+    if (!h) return h;
+
+    // Strip legacy "emoji + space" prefix from name
+    const name = String(h.name || '');
+    const cleaned = name.replace(/^[^\w\s]{1,3}\s+/u, '');
+
+    // Provide stable icon for UI only
+    const type = h.type || getHabitTypeFromName(cleaned);
+    const iconEmoji = h.iconEmoji
+      ? String(h.iconEmoji)
+      : habitEmoji(cleaned);
+
+    return { ...h, name: cleaned, type, iconEmoji };
+  }
+
   function habitEmoji(name) {
     const text = name.toLowerCase();
-    if (text.includes('gym') || text.includes('lift') || text.includes('workout')) return 'ðŸ’ª';
-    if (text.includes('run') || text.includes('cardio')) return 'ðŸƒ';
-    if (text.includes('water') || text.includes('hydrate')) return 'ðŸ’§';
-    if (text.includes('sleep') || text.includes('bed')) return 'ðŸ˜´';
-    if (text.includes('meditate') || text.includes('mind')) return 'ðŸ§˜';
-    if (text.includes('read')) return 'ðŸ“š';
-    if (text.includes('walk')) return 'ðŸš¶';
-    if (text.includes('meal') || text.includes('protein') || text.includes('nutrition')) return 'ðŸ¥—';
-    return 'â­';
+    if (text.includes('gym') || text.includes('lift') || text.includes('workout')) return '\u{1F4AA}';
+    if (text.includes('run') || text.includes('cardio')) return '\u{1F3C3}';
+    if (text.includes('water') || text.includes('hydrate')) return '\u{1F4A7}';
+    if (text.includes('sleep') || text.includes('bed')) return '\u{1F634}';
+    if (text.includes('meditate') || text.includes('mind')) return '\u{1F9D8}';
+    if (text.includes('read')) return '\u{1F4DA}';
+    if (text.includes('walk')) return '\u{1F6B6}';
+    if (text.includes('meal') || text.includes('protein') || text.includes('nutrition')) return '\u{1F957}';
+    return '\u{2B50}';
   }
 
   async function handleCreateHabit() {
     const name = formatHabitName(newHabitName);
     if (!name) return;
-    const decorated = `${habitEmoji(name)} ${name}`;
-    const type = getHabitTypeFromName(decorated);
-    const created = await createHabit(decorated, type);
+    const type = getHabitTypeFromName(name);
+    const created = await createHabit(name, type);
     setNewHabitName('');
     setHabitId(created.id);
     await refresh();
@@ -2028,23 +2099,27 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     input.click();
   }
 
-  if (loading || !snapshot) {
-    return (
-      <View style={styles.loadingContainer}>
-        <View style={styles.loadingPanel}>
-          <Image
-            source={require('../../assets/lifemaxxing-logo.png')}
-            style={styles.loadingLogo}
-            accessibilityLabel="Lifemaxxing logo"
-          />
-          <Text style={styles.loadingTitle}>Lifemaxxing</Text>
-          <Text style={styles.loadingSubtle}>Stabilizing identity...</Text>
-        </View>
-      </View>
-    );
-  }
+  const isReady = !loading && snapshot;
+  const safeSnapshot = snapshot || {
+    identity: { level: 1, totalEffortUnits: 0 },
+    counts: { habits: 0, efforts: 0, chests: 0 },
+  };
 
-  const { identity, counts } = snapshot;
+  const loadingContent = (
+    <View style={styles.loadingContainer}>
+      <View style={styles.loadingPanel}>
+        <Image
+          source={require('../../assets/lifemaxxing-logo.png')}
+          style={styles.loadingLogo}
+          accessibilityLabel="Lifemaxxing logo"
+        />
+        <Text style={styles.loadingTitle}>Lifemaxxing</Text>
+        <Text style={styles.loadingSubtle}>Stabilizing identity...</Text>
+      </View>
+    </View>
+  );
+
+  const { identity, counts } = safeSnapshot;
   const unlockedItems = items.filter((item) => !item.locked);
   const unlockedCards = cards.filter((card) => !card.locked);
   const visibleCards = phase2Active ? unlockedCards : [];
@@ -2066,7 +2141,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   });
   const activeHabitList = habits.filter((habit) => habit.isActive);
   const defaultHabit = activeHabitList[0] || habits[0] || null;
-  const hasLockedChest = Boolean(combatChest);
+  const hasLockedChest = Boolean(ritualChest);
   const primaryAction = (() => {
     if (habits.length === 0) {
       return {
@@ -2083,10 +2158,10 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
         title: 'Log one action',
         helper: defaultHabit ? `Next up: ${defaultHabit.name}` : 'Log any habit action.',
         cta: 'Log action',
-        onPress: () => {
+            onPress: () => {
           if (defaultHabit) {
             if (!defaultHabit.isActive) {
-              setHabitDetailId(defaultHabit.id);
+              openHabitSpace(defaultHabit.id);
               return;
             }
             handleHabitAction(defaultHabit);
@@ -2099,7 +2174,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
         title: 'Open chest',
         helper: 'Rewards are ready to unlock.',
         cta: 'Open chest',
-        onPress: () => setActiveTab('Inventory'),
+        onPress: openLatestChest,
       };
     }
     if (phase2Active) {
@@ -2118,14 +2193,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     };
   })();
   const currentArcQuest = arcQuests.find((quest) => quest.accepted) || arcQuests[0] || null;
-  const habitDetail = habitDetailId ? habitById.get(habitDetailId) : null;
-  const habitDetailLogs = habitDetail
-    ? [...efforts]
-        .filter((effort) => effort.habitId === habitDetail.id)
-        .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-        .slice(0, 5)
-    : [];
-  const habitDetailNote = habitDetail ? habitNotes[habitDetail.id] || '' : '';
+  const habitDetail = habitSpaceHabitId ? habitById.get(habitSpaceHabitId) : null;
   const adminCommands = useMemo(() => {
     const seasonOptions = SEASON_MANIFEST.map((season) => season.id);
     const questOptions = arcQuests.map((quest) => quest.id);
@@ -2156,8 +2224,8 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
         id: 'open_chest',
         label: 'Open chest immediately',
         run: async () => {
-          if (!combatChest?.id) return 'No locked chest found.';
-          await adminUnlockAllChestRewards({ chestId: combatChest.id });
+          if (!ritualChest?.id) return 'No locked chest found.';
+          await adminUnlockAllChestRewards({ chestId: ritualChest.id });
           await refresh();
           return 'Chest unlocked.';
         },
@@ -2370,7 +2438,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
         },
       },
     ];
-  }, [arcQuests, habits, combatChest, habitById, defaultHabit, isQuietMode, phase2Active]);
+  }, [arcQuests, habits, ritualChest, habitById, defaultHabit, isQuietMode, phase2Active]);
 
   function getHabitTags(name) {
     const text = name.toLowerCase();
@@ -2506,8 +2574,29 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     setAdminTapCount(nextCount);
     if (nextCount >= 5) {
       setAdminTapCount(0);
-      setAdminPaletteOpen(true);
+      openAdminPanel();
     }
+  }
+
+  function openHabitSpace(id) {
+    if (id) {
+      setSelectedChallengeHabitId(id);
+    }
+    setHabitSpaceHabitId(id || null);
+    setHabitSpaceOpen(true);
+  }
+
+  function closeHabitSpace() {
+    setHabitSpaceOpen(false);
+    setHabitSpaceHabitId(null);
+  }
+
+  function openAdminPanel() {
+    setAdminPanelOpen(true);
+  }
+
+  function closeAdminPanel() {
+    setAdminPanelOpen(false);
   }
 
   const filteredAdminCommands = adminCommands.filter((command) =>
@@ -2697,7 +2786,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     return `Last logged ${action} for ${name} (${units} unit${units === 1 ? '' : 's'}) on ${timestamp}`;
   }
 
-  const mainContent = (
+  const mainContent = isReady ? (
     <>
       <Text style={styles.title}>Lifemaxxing</Text>
 
@@ -2762,233 +2851,313 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
       ) : null}
 
       {showTasks ? (
-        <View style={styles.panel}>
-          <View style={styles.primaryActionCard}>
-            <Text style={styles.primaryActionLabel}>Primary Action</Text>
-            <Text style={styles.primaryActionTitle}>{primaryAction.title}</Text>
-            <Text style={styles.primaryActionHelper}>{primaryAction.helper}</Text>
+        <>
+          <View style={styles.encounterCard}>
+            <View style={styles.encounterHeaderRow}>
+              <Text style={styles.encounterLabel}>Encounter</Text>
+              {hasLockedChest ? (
+                <Pressable style={styles.encounterBadge} onPress={openLatestChest}>
+                  <Text style={styles.encounterBadgeText}>Chest earned</Text>
+                </Pressable>
+              ) : null}
+            </View>
+            <Text style={styles.encounterTitle}>{primaryAction.title}</Text>
+            <Text style={styles.encounterHelper}>{primaryAction.helper}</Text>
             <Pressable style={styles.primaryActionButton} onPress={primaryAction.onPress}>
               <Text style={styles.primaryActionButtonText}>{primaryAction.cta}</Text>
             </Pressable>
           </View>
-          {chestNotice?.chestId ? (
-            <View style={styles.noticeCard}>
-              <Text style={styles.noticeTitle}>Chest earned</Text>
-              <Text style={styles.noticeSubtle}>Your rewards are waiting.</Text>
-              <Pressable
-                style={styles.buttonSmall}
-                onPress={() => {
-                  setChestNotice(null);
-                  setActiveTab('Inventory');
-                }}
-              >
-                <Text style={styles.buttonText}>Open chest</Text>
-              </Pressable>
-            </View>
-          ) : null}
-          <Text style={styles.panelTitle}>Status</Text>
-          <View style={styles.heroRow}>
-            <View style={styles.avatarBox}>
-              <Text style={styles.avatarText}>SIGIL</Text>
-            </View>
-            <View style={styles.heroStats}>
-              <Text style={styles.heroLabel}>Identity</Text>
-              <Text style={styles.heroValue}>Level {identity.level}</Text>
-              <Text style={styles.heroSubtle}>Title: {identityTitle}</Text>
-              <View style={styles.heroVitals}>
-                <View style={styles.heroVitalChip}>
-                  <Text style={styles.heroVitalLabel}>HP</Text>
-                  <Text style={styles.heroVitalValue}>{phase2Stats.hp}</Text>
-                </View>
-                <View style={styles.heroVitalChip}>
-                  <Text style={styles.heroVitalLabel}>MP</Text>
-                  <Text style={styles.heroVitalValue}>{phase2Stats.mp}</Text>
-                </View>
-              </View>
-            </View>
-          </View>
-          <View style={styles.expRow}>
-            <Text style={styles.expLabel}>Growth</Text>
-            <View style={styles.expTrack}>
-              <Animated.View
-                style={[
-                  styles.expFill,
-                  {
-                    width: expAnim.current.interpolate({
-                      inputRange: [0, 1],
-                      outputRange: ['0%', '100%'],
-                    }),
-                  },
-                ]}
-              />
-            </View>
-            {phase2Active ? (
-              <Pressable
-                style={[styles.expToggle, expNotesEnabled && styles.expToggleActive]}
-                onPress={() => setExpNotesEnabled((prev) => !prev)}
-              >
-                <Text
-                  style={[styles.expToggleText, expNotesEnabled && styles.expToggleTextActive]}
-                >
-                  Growth notes: {expNotesEnabled ? 'On' : 'Off'}
-                </Text>
-              </Pressable>
-            ) : null}
-            {expNoteMessage ? <Text style={styles.expNote}>{expNoteMessage}</Text> : null}
-          </View>
-          <View style={styles.divider} />
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Habits</Text>
-            <Text style={styles.statValue}>{counts.habits}</Text>
-          </View>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Actions Logged</Text>
-            <Text style={styles.statValue}>{counts.efforts}</Text>
-          </View>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Chests Earned</Text>
-            <Text style={styles.statValue}>{counts.chests}</Text>
-          </View>
-          <Text style={styles.subtle}>
-            Re-entry mode: {isQuietMode ? 'quiet' : 'standard'}
-          </Text>
-          <Text style={styles.subtle}>
-            Active habits: {activeHabits} - Paused: {pausedHabits}
-          </Text>
-          {!EMAIL_AUTH_ENABLED ? (
-            <Text style={styles.subtle}>
-              Email sign-in disabled until a domain is configured.
-            </Text>
-          ) : null}
-          {mercyStatus?.eligible ? (
-            <Text style={styles.subtle}>Mercy active: slight chest boost on next effort.</Text>
-          ) : null}
-          {mercyStatus && !mercyStatus.eligible && mercyStatus.cooldownDaysRemaining > 0 ? (
-            <Text style={styles.subtle}>
-              Mercy recharges in {mercyStatus.cooldownDaysRemaining} days.
-            </Text>
-          ) : null}
-        </View>
-      ) : null}
 
-      {showTasks ? (
-        <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Today</Text>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Momentum</Text>
-            <Text style={styles.statValue}>{phase2Stats.momentum}</Text>
-          </View>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Consistency</Text>
-            <Text style={styles.statValue}>{phase2Stats.consistency}</Text>
-          </View>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Vitality</Text>
-            <Text style={styles.statValue}>{phase2Stats.vitality}</Text>
-          </View>
-          <Text style={styles.subtle}>Soft stats only. No urgency, no pressure.</Text>
-        </View>
-      ) : null}
-
-      {showTasks && evidence ? (
-        <View style={[styles.panel, styles.panelTight]}>
-          <Text style={styles.panelTitle}>Evidence</Text>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Days Shown Up</Text>
-            <Text style={styles.statValue}>{evidence.activeDays}</Text>
-          </View>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Last Action</Text>
-            <Text style={styles.statValue}>
-              {evidence.lastEffortAt
-                ? new Date(evidence.lastEffortAt).toLocaleDateString()
-                : 'No log yet'}
-            </Text>
-          </View>
-          <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Last Chest</Text>
-            <Text style={styles.statValue}>
-              {evidence.lastChestAt
-                ? new Date(evidence.lastChestAt).toLocaleDateString()
-                : 'No chest yet'}
-            </Text>
-          </View>
-        </View>
-      ) : null}
-
-        {showTasks ? (
-          <View style={styles.panel}>
-            {shouldShowOrientation && (
-              <View style={styles.orientationPanel}>
-                <Text style={styles.panelTitle}>Take the First Step</Text>
-                <Text style={styles.orientationSubtitle}>Every system begins with a single signal.</Text>
-                <Text style={styles.orientationObjective}>Objective: Log any action once.</Text>
-                <Text style={styles.subtle}>
-                  This is enough for now. Action first, explanation later.
-                </Text>
-                <View style={styles.orientationActions}>
-                  <Pressable
-                    style={[
-                      styles.buttonSmall,
-                      styles.orientationActionButton,
-                      orientationAccepted && styles.buttonDisabled,
-                    ]}
-                    onPress={handleAcceptOrientation}
-                    disabled={orientationAccepted}
-                  >
-                    <Text style={styles.buttonText}>
-                      {orientationAccepted ? 'Quest accepted' : 'Accept quest'}
-                    </Text>
-                  </Pressable>
-                  <Pressable
-                    style={[styles.buttonGhost, styles.orientationIgnore]}
-                    onPress={handleIgnoreOrientation}
-                  >
-                    <Text style={styles.buttonGhostText}>Ignore for now</Text>
-                  </Pressable>
-                </View>
-              </View>
-            )}
-            {orientationMessage ? (
-              <View style={styles.orientationMessage}>
-                <Text style={styles.orientationMessageText}>{orientationMessage}</Text>
-              </View>
-            ) : null}
-            <Text style={styles.panelTitle}>Current Arc Quest</Text>
-            {!currentArcQuest ? (
-              <Text style={styles.subtle}>Arc quests appear quietly over time.</Text>
+          <View style={[styles.panel, styles.panelTight]}>
+            <Text style={styles.panelTitle}>Habits</Text>
+            {habits.length === 0 ? (
+              <Text style={styles.subtle}>No habits yet. Create one below.</Text>
             ) : (
-              <>
-                <View style={styles.arcList}>{renderArcQuestCard(currentArcQuest)}</View>
-                {arcQuests.length > 1 ? (
-                  <Pressable
-                    style={styles.buttonGhost}
-                    onPress={() => setShowAllArcQuests((prev) => !prev)}
-                  >
-                    <Text style={styles.buttonGhostText}>
-                      {showAllArcQuests ? 'Hide quests' : 'View all quests'}
-                    </Text>
-                  </Pressable>
+              habits.map((habit) => {
+                const actionConfig = getHabitActionConfig(habit);
+                return (
+                  <View key={habit.id} style={styles.habitListRow}>
+                    <Pressable
+                      style={[
+                        styles.habitCard,
+                        !habit.isActive && styles.habitCardPaused,
+                      ]}
+                      onPress={() => openHabitSpace(habit.id)}
+                    >
+                      <Text style={styles.habitCardTitle}>{habit.name}</Text>
+                      <Text style={styles.habitCardMeta}>
+                        {habit.isActive ? 'Active' : 'Paused'}
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.habitQuickButton, !habit.isActive && styles.buttonDisabled]}
+                      onPress={() => handleHabitAction(habit)}
+                      disabled={!habit.isActive}
+                    >
+                      <Text style={styles.habitQuickButtonText}>{actionConfig.label}</Text>
+                    </Pressable>
+                  </View>
+                );
+              })
+            )}
+            <View style={styles.habitInputRow}>
+              <TextInput
+                ref={newHabitInputRef}
+                value={newHabitName}
+                onChangeText={setNewHabitName}
+                placeholder="New habit name"
+                placeholderTextColor="#4b5563"
+                style={styles.input}
+              />
+              <Pressable style={styles.buttonSmall} onPress={handleCreateHabit}>
+                <Text style={styles.buttonText}>Add</Text>
+              </Pressable>
+            </View>
+          </View>
+
+          <View style={styles.collapseCard}>
+            <Pressable
+              style={styles.collapseHeader}
+              onPress={() => setTasksStatusOpen((prev) => !prev)}
+            >
+              <Text style={styles.collapseTitle}>Status</Text>
+              <Text style={styles.collapseAction}>{tasksStatusOpen ? 'Hide' : 'Show'}</Text>
+            </Pressable>
+            {tasksStatusOpen ? (
+              <View style={styles.collapseBody}>
+                <View style={styles.heroRow}>
+                  <View style={styles.avatarBox}>
+                    <Text style={styles.avatarText}>SIGIL</Text>
+                  </View>
+                  <View style={styles.heroStats}>
+                    <Text style={styles.heroLabel}>Identity</Text>
+                    <Text style={styles.heroValue}>Level {identity.level}</Text>
+                    <Text style={styles.heroSubtle}>Title: {identityTitle}</Text>
+                    <View style={styles.heroVitals}>
+                      <View style={styles.heroVitalChip}>
+                        <Text style={styles.heroVitalLabel}>HP</Text>
+                        <Text style={styles.heroVitalValue}>{phase2Stats.hp}</Text>
+                      </View>
+                      <View style={styles.heroVitalChip}>
+                        <Text style={styles.heroVitalLabel}>MP</Text>
+                        <Text style={styles.heroVitalValue}>{phase2Stats.mp}</Text>
+                      </View>
+                    </View>
+                  </View>
+                </View>
+                <View style={styles.divider} />
+                <View style={styles.statRow}>
+                  <Text style={styles.statLabel}>Habits</Text>
+                  <Text style={styles.statValue}>{counts.habits}</Text>
+                </View>
+                <View style={styles.statRow}>
+                  <Text style={styles.statLabel}>Actions Logged</Text>
+                  <Text style={styles.statValue}>{counts.efforts}</Text>
+                </View>
+                <View style={styles.statRow}>
+                  <Text style={styles.statLabel}>Chests Earned</Text>
+                  <Text style={styles.statValue}>{counts.chests}</Text>
+                </View>
+                <Text style={styles.subtle}>
+                  Re-entry mode: {isQuietMode ? 'quiet' : 'standard'}
+                </Text>
+                <Text style={styles.subtle}>
+                  Active habits: {activeHabits} - Paused: {pausedHabits}
+                </Text>
+                {!EMAIL_AUTH_ENABLED ? (
+                  <Text style={styles.subtle}>
+                    Email sign-in disabled until a domain is configured.
+                  </Text>
                 ) : null}
-                {showAllArcQuests ? (
-                  <View style={styles.arcList}>
-                    {arcQuests
-                      .filter((quest) => quest.id !== currentArcQuest.id)
-                      .map((quest) => renderArcQuestCard(quest))}
+                {mercyStatus?.eligible ? (
+                  <Text style={styles.subtle}>Mercy active: slight chest boost on next effort.</Text>
+                ) : null}
+                {mercyStatus && !mercyStatus.eligible && mercyStatus.cooldownDaysRemaining > 0 ? (
+                  <Text style={styles.subtle}>
+                    Mercy recharges in {mercyStatus.cooldownDaysRemaining} days.
+                  </Text>
+                ) : null}
+              </View>
+            ) : null}
+          </View>
+
+          <View style={styles.collapseCard}>
+            <Pressable
+              style={styles.collapseHeader}
+              onPress={() => setTasksEvidenceOpen((prev) => !prev)}
+            >
+              <Text style={styles.collapseTitle}>Evidence</Text>
+              <Text style={styles.collapseAction}>{tasksEvidenceOpen ? 'Hide' : 'Show'}</Text>
+            </Pressable>
+            {tasksEvidenceOpen ? (
+              <View style={styles.collapseBody}>
+                <View style={styles.expRow}>
+                  <Text style={styles.expLabel}>Growth</Text>
+                  <View style={styles.expTrack}>
+                    <Animated.View
+                      style={[
+                        styles.expFill,
+                        {
+                          width: expAnim.current.interpolate({
+                            inputRange: [0, 1],
+                            outputRange: ['0%', '100%'],
+                          }),
+                        },
+                      ]}
+                    />
+                  </View>
+                  {phase2Active ? (
+                    <Pressable
+                      style={[styles.expToggle, expNotesEnabled && styles.expToggleActive]}
+                      onPress={() => setExpNotesEnabled((prev) => !prev)}
+                    >
+                      <Text
+                        style={[styles.expToggleText, expNotesEnabled && styles.expToggleTextActive]}
+                      >
+                        Growth notes: {expNotesEnabled ? 'On' : 'Off'}
+                      </Text>
+                    </Pressable>
+                  ) : null}
+                  {expNoteMessage ? <Text style={styles.expNote}>{expNoteMessage}</Text> : null}
+                </View>
+                <View style={styles.statRow}>
+                  <Text style={styles.statLabel}>Momentum</Text>
+                  <Text style={styles.statValue}>{phase2Stats.momentum}</Text>
+                </View>
+                <View style={styles.statRow}>
+                  <Text style={styles.statLabel}>Consistency</Text>
+                  <Text style={styles.statValue}>{phase2Stats.consistency}</Text>
+                </View>
+                <View style={styles.statRow}>
+                  <Text style={styles.statLabel}>Vitality</Text>
+                  <Text style={styles.statValue}>{phase2Stats.vitality}</Text>
+                </View>
+                <Text style={styles.subtle}>Soft stats only. No urgency, no pressure.</Text>
+                {evidence ? (
+                  <>
+                    <View style={styles.divider} />
+                    <View style={styles.statRow}>
+                      <Text style={styles.statLabel}>Days Shown Up</Text>
+                      <Text style={styles.statValue}>{evidence.activeDays}</Text>
+                    </View>
+                    <View style={styles.statRow}>
+                      <Text style={styles.statLabel}>Last Action</Text>
+                      <Text style={styles.statValue}>
+                        {evidence.lastEffortAt
+                          ? new Date(evidence.lastEffortAt).toLocaleDateString()
+                          : 'No log yet'}
+                      </Text>
+                    </View>
+                    <View style={styles.statRow}>
+                      <Text style={styles.statLabel}>Last Chest</Text>
+                      <Text style={styles.statValue}>
+                        {evidence.lastChestAt
+                          ? new Date(evidence.lastChestAt).toLocaleDateString()
+                          : 'No chest yet'}
+                      </Text>
+                    </View>
+                  </>
+                ) : (
+                  <Text style={styles.subtle}>Evidence appears after the first action.</Text>
+                )}
+              </View>
+            ) : null}
+          </View>
+
+          <View style={styles.collapseCard}>
+            <Pressable
+              style={styles.collapseHeader}
+              onPress={() => setTasksOrientationOpen((prev) => !prev)}
+            >
+              <Text style={styles.collapseTitle}>Orientation</Text>
+              <Text style={styles.collapseAction}>
+                {tasksOrientationOpen ? 'Hide' : 'Show'}
+              </Text>
+            </Pressable>
+            {tasksOrientationOpen ? (
+              <View style={styles.collapseBody}>
+                {shouldShowOrientation ? (
+                  <View style={styles.orientationPanel}>
+                    <Text style={styles.panelTitle}>Take the First Step</Text>
+                    <Text style={styles.orientationSubtitle}>
+                      Every system begins with a single signal.
+                    </Text>
+                    <Text style={styles.orientationObjective}>Objective: Log any action once.</Text>
+                    <Text style={styles.subtle}>
+                      This is enough for now. Action first, explanation later.
+                    </Text>
+                    <View style={styles.orientationActions}>
+                      <Pressable
+                        style={[
+                          styles.buttonSmall,
+                          styles.orientationActionButton,
+                          orientationAccepted && styles.buttonDisabled,
+                        ]}
+                        onPress={handleAcceptOrientation}
+                        disabled={orientationAccepted}
+                      >
+                        <Text style={styles.buttonText}>
+                          {orientationAccepted ? 'Quest accepted' : 'Accept quest'}
+                        </Text>
+                      </Pressable>
+                      <Pressable
+                        style={[styles.buttonGhost, styles.orientationIgnore]}
+                        onPress={handleIgnoreOrientation}
+                      >
+                        <Text style={styles.buttonGhostText}>Ignore for now</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                ) : (
+                  <Text style={styles.subtle}>Orientation is complete.</Text>
+                )}
+                {orientationMessage ? (
+                  <View style={styles.orientationMessage}>
+                    <Text style={styles.orientationMessageText}>{orientationMessage}</Text>
                   </View>
                 ) : null}
-              </>
-            )}
+              </View>
+            ) : null}
           </View>
-      ) : null}
 
-      {showTasks && isQuietMode ? (
-        <View style={styles.panelQuiet}>
-          <Text style={styles.panelTitle}>Re-entry</Text>
-          <Text style={styles.quietText}>
-            No backlog. Start small and log a single action when ready.
-          </Text>
-        </View>
+          <View style={styles.collapseCard}>
+            <Pressable
+              style={styles.collapseHeader}
+              onPress={() => setTasksArcOpen((prev) => !prev)}
+            >
+              <Text style={styles.collapseTitle}>Arc Quest</Text>
+              <Text style={styles.collapseAction}>{tasksArcOpen ? 'Hide' : 'Show'}</Text>
+            </Pressable>
+            {tasksArcOpen ? (
+              <View style={styles.collapseBody}>
+                {!currentArcQuest ? (
+                  <Text style={styles.subtle}>Arc quests appear quietly over time.</Text>
+                ) : (
+                  <>
+                    <View style={styles.arcList}>{renderArcQuestCard(currentArcQuest)}</View>
+                    {arcQuests.length > 1 ? (
+                      <Pressable
+                        style={styles.buttonGhost}
+                        onPress={() => setShowAllArcQuests((prev) => !prev)}
+                      >
+                        <Text style={styles.buttonGhostText}>
+                          {showAllArcQuests ? 'Hide quests' : 'View all quests'}
+                        </Text>
+                      </Pressable>
+                    ) : null}
+                    {showAllArcQuests ? (
+                      <View style={styles.arcList}>
+                        {arcQuests
+                          .filter((quest) => quest.id !== currentArcQuest.id)
+                          .map((quest) => renderArcQuestCard(quest))}
+                      </View>
+                    ) : null}
+                  </>
+                )}
+              </View>
+            ) : null}
+          </View>
+        </>
       ) : null}
 
       {showHelp ? (
@@ -3146,7 +3315,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
               <Text style={styles.subtle}>Manual checklist (dev sanity):</Text>
               <View style={styles.trustList}>
                 <Text style={styles.trustItem}>* Reopen after inactivity feels safe</Text>
-                <Text style={styles.trustItem}>* Losing combat has zero downside</Text>
+                <Text style={styles.trustItem}>* Opening a chest never harms you</Text>
                 <Text style={styles.trustItem}>* Consistency beats spikes</Text>
                 <Text style={styles.trustItem}>* Power never appears without effort</Text>
                 <Text style={styles.trustItem}>* Identity never decreases</Text>
@@ -3159,55 +3328,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
       ) : null}
           
           
-
-              {showTasks ? (
-        <View style={[styles.panel, styles.panelTight]}>
-          <Text style={styles.panelTitle}>Habits</Text>
-          {habits.length === 0 ? (
-            <Text style={styles.subtle}>No habits yet. Create one below.</Text>
-          ) : (
-            habits.map((habit) => {
-              const actionConfig = getHabitActionConfig(habit);
-              return (
-                <View key={habit.id} style={styles.habitListRow}>
-                  <Pressable
-                    style={[
-                      styles.habitCard,
-                      !habit.isActive && styles.habitCardPaused,
-                    ]}
-                    onPress={() => setHabitDetailId(habit.id)}
-                  >
-                    <Text style={styles.habitCardTitle}>{habit.name}</Text>
-                    <Text style={styles.habitCardMeta}>
-                      {habit.isActive ? 'Active' : 'Paused'}
-                    </Text>
-                  </Pressable>
-                  <Pressable
-                    style={[styles.habitQuickButton, !habit.isActive && styles.buttonDisabled]}
-                    onPress={() => handleHabitAction(habit)}
-                    disabled={!habit.isActive}
-                  >
-                    <Text style={styles.habitQuickButtonText}>{actionConfig.label}</Text>
-                  </Pressable>
-                </View>
-              );
-            })
-          )}
-          <View style={styles.habitInputRow}>
-            <TextInput
-              ref={newHabitInputRef}
-              value={newHabitName}
-              onChangeText={setNewHabitName}
-              placeholder="New habit name"
-              placeholderTextColor="#4b5563"
-              style={styles.input}
-            />
-            <Pressable style={styles.buttonSmall} onPress={handleCreateHabit}>
-              <Text style={styles.buttonText}>Add</Text>
-            </Pressable>
-          </View>
-        </View>
-      ) : null}
 
       {showInventory ? (
         <View style={styles.panel}>
@@ -3315,7 +3435,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
                       styles.challengeHabitChip,
                       selectedChallengeHabitId === habit.id && styles.challengeHabitChipActive,
                     ]}
-                    onPress={() => setSelectedChallengeHabitId(habit.id)}
+                    onPress={() => openHabitSpace(habit.id)}
                   >
                     <Text style={styles.challengeHabitText}>{habit.name}</Text>
                   </Pressable>
@@ -3443,35 +3563,30 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
       {showInventory ? (
         <View style={styles.menuStack}>
           <View style={styles.menuHeader}>
-            <Text style={styles.panelTitle}>Unlocks</Text>
-            <Text style={styles.menuHint}>Combat unlocks rewards already earned.</Text>
+            <Text style={styles.panelTitle}>Encounter</Text>
+            <Text style={styles.menuHint}>Open what you already earned.</Text>
           </View>
           <View style={styles.menuSection}>
-            <Text style={styles.menuLabel}>Encounter</Text>
-            {combatChest ? (
+            <Text style={styles.menuLabel}>Chest</Text>
+            {ritualChest ? (
               <>
                 <Text style={styles.subtle}>
-                  {combatChest.rarity} chest - {combatChest.lockedCount} locked
+                  {ritualChest.rarity} chest • {ritualChest.lockedCount} inside
                 </Text>
-                <View style={styles.combatRow}>
-                  <Pressable style={styles.button} onPress={() => handleCombat('win')}>
-                    <Text style={styles.buttonText}>Resolve: Win</Text>
-                  </Pressable>
-                  <Pressable style={styles.buttonGhost} onPress={() => handleCombat('lose')}>
-                    <Text style={styles.buttonGhostText}>Resolve: Loss</Text>
-                  </Pressable>
-                </View>
+                <Pressable style={styles.button} onPress={handleOpenChest}>
+                  <Text style={styles.buttonText}>Open chest</Text>
+                </Pressable>
               </>
             ) : (
-              <Text style={styles.subtle}>No locked rewards to unlock.</Text>
+              <Text style={styles.subtle}>No chests waiting right now.</Text>
             )}
-            {combatMessage ? <Text style={styles.subtle}>{combatMessage}</Text> : null}
+            {ritualMessage ? <Text style={styles.subtle}>{ritualMessage}</Text> : null}
           </View>
           <View style={styles.menuDivider} />
           <View style={styles.menuSection}>
             <Text style={styles.menuLabel}>Inventory</Text>
             {unlockedItems.length === 0 && !hasVisibleCards ? (
-              <Text style={styles.subtle}>Rewards remain locked until combat unlocks them.</Text>
+              <Text style={styles.subtle}>Rewards appear here after you open a chest.</Text>
             ) : (
               <>
                 {unlockedItems.length > 0 ? (
@@ -3523,7 +3638,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
           <Text style={styles.subtle}>Manual checklist (dev sanity):</Text>
           <View style={styles.trustList}>
             <Text style={styles.trustItem}>* Reopen after inactivity feels safe</Text>
-            <Text style={styles.trustItem}>* Losing combat has zero downside</Text>
+            <Text style={styles.trustItem}>* Opening a chest never harms you</Text>
             <Text style={styles.trustItem}>* Consistency beats spikes</Text>
             <Text style={styles.trustItem}>* Power never appears without effort</Text>
             <Text style={styles.trustItem}>* Identity never decreases</Text>
@@ -3531,7 +3646,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
         </View>
       ) : null}
     </>
-  );
+  ) : null;
 
   return (
     <View style={styles.appFrame}>
@@ -3544,6 +3659,18 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
           accessibilityIgnoresInvertColors
         />
       </Pressable>
+      {ritualOverlayOpen && ritualOverlayChest ? (
+        <RitualOverlay
+          chest={ritualOverlayChest}
+          rewards={ritualOverlayRewards}
+          onClose={() => {
+            setRitualOverlayOpen(false);
+            setRitualOverlayChest(null);
+            setRitualOverlayRewards([]);
+            refresh();
+          }}
+        />
+      ) : null}
       {arcOverlay ? (
         <View style={styles.arcOverlay}>
           <View style={styles.arcOverlayCard}>
@@ -3593,99 +3720,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
             )}
             <Pressable style={styles.button} onPress={() => setGallerySelection(null)}>
               <Text style={styles.buttonText}>Close</Text>
-            </Pressable>
-          </View>
-        </View>
-      ) : null}
-      {habitDetail ? (
-        <View style={styles.habitDetailOverlay}>
-          <View style={styles.habitDetailCard}>
-            <Text style={styles.habitDetailTitle}>{habitDetail.name}</Text>
-            <Text style={styles.habitDetailMeta}>
-              {habitDetail.isActive ? 'Active' : 'Paused'} Â·{' '}
-              {getHabitActionConfig(habitDetail).summary}
-            </Text>
-            {getHabitActionConfig(habitDetail).type === 'water' ? (
-              <Text style={styles.habitDetailMeta}>
-                {habitActionCounts[habitDetail.id] ?? 0} cup
-                {(habitActionCounts[habitDetail.id] ?? 0) === 1 ? '' : 's'} today
-              </Text>
-            ) : null}
-            <View style={styles.habitDetailActions}>
-              <Pressable
-                style={[
-                  styles.habitDetailPrimaryButton,
-                  !habitDetail.isActive && styles.buttonDisabled,
-                ]}
-                onPress={() =>
-                  handleLogEffort({
-                    habitId: habitDetail.id,
-                    note: habitLogNote,
-                  })
-                }
-                disabled={!habitDetail.isActive}
-              >
-                <Text style={styles.habitDetailPrimaryText}>
-                  {getHabitActionConfig(habitDetail).label}
-                </Text>
-              </Pressable>
-              <Pressable
-                style={styles.habitDetailSecondaryButton}
-                onPress={() => handleToggleHabit(habitDetail)}
-              >
-                <Text style={styles.habitDetailSecondaryText}>
-                  {habitDetail.isActive ? 'Pause' : 'Resume'}
-                </Text>
-              </Pressable>
-              <Pressable
-                style={styles.habitDetailDeleteButton}
-                onPress={() => handleDeleteHabit(habitDetail)}
-              >
-                <Text style={styles.habitDetailDeleteText}>Delete</Text>
-              </Pressable>
-            </View>
-            <Text style={styles.habitDetailSectionLabel}>Quick Log Note (optional)</Text>
-            <TextInput
-              value={habitLogNote}
-              onChangeText={setHabitLogNote}
-              placeholder="Add a short note for this log..."
-              placeholderTextColor="#4b5563"
-              style={styles.habitDetailInput}
-            />
-            <Text style={styles.habitDetailSectionLabel}>Habit Notes</Text>
-            <TextInput
-              value={habitDetailNote}
-              onChangeText={(value) =>
-                setHabitNotes((prev) => ({ ...prev, [habitDetail.id]: value }))
-              }
-              placeholder="Optional notes about this habit..."
-              placeholderTextColor="#4b5563"
-              style={styles.habitDetailInput}
-              multiline
-            />
-            <Text style={styles.habitDetailSectionLabel}>Rest Days</Text>
-            <Text style={styles.habitDetailMeta}>Not configured.</Text>
-            <Text style={styles.habitDetailSectionLabel}>Recent Logs</Text>
-            {habitDetailLogs.length === 0 ? (
-              <Text style={styles.habitDetailMeta}>No actions logged yet.</Text>
-            ) : (
-              habitDetailLogs.map((log) => (
-                <Text key={log.id} style={styles.habitDetailLog}>
-                  {new Date(log.timestamp).toLocaleDateString()} Â·{' '}
-                  {log.actionType?.replace('_', ' ') || 'action'} Â·{' '}
-                  {typeof log.units === 'number' ? log.units : 1} unit
-                  {typeof log.units === 'number' && log.units === 1 ? '' : 's'}
-                </Text>
-              ))
-            )}
-            <Pressable
-              style={styles.buttonGhost}
-              onPress={() => {
-                setHabitDetailId(null);
-                setHabitLogNote('');
-              }}
-            >
-              <Text style={styles.buttonGhostText}>Close</Text>
             </Pressable>
           </View>
         </View>
@@ -3755,6 +3789,44 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
             ) : null}
           </Pressable>
         </Pressable>
+      ) : null}
+      <SlideOverFullScreen
+        open={habitSpaceOpen}
+        onClose={closeHabitSpace}
+        from="right"
+        title="Habit Space"
+      >
+        <HabitSpaceOverlay
+          habitId={habitSpaceHabitId}
+          habits={habits}
+          efforts={efforts}
+          arcQuests={arcQuests}
+          onClose={closeHabitSpace}
+          onLog={() => {
+            if (habitDetail) handleHabitAction(habitDetail);
+          }}
+          onRest={() => {
+            setOrientationMessage('Rest tracked soon.');
+          }}
+          onAcceptArc={handleAcceptArcForHabit}
+          onIgnoreArc={handleIgnoreArc}
+        />
+      </SlideOverFullScreen>
+
+      {adminAvailable ? (
+        <SlideOverFullScreen
+          open={adminPanelOpen}
+          onClose={closeAdminPanel}
+          from="right"
+          title="Admin"
+        >
+          {Platform.OS === 'web' && isAdmin ? (
+            <AdminPanelWeb
+              onClose={closeAdminPanel}
+              onOpenCommandPalette={() => setAdminPaletteOpen(true)}
+            />
+          ) : null}
+        </SlideOverFullScreen>
       ) : null}
       {showOnboarding ? (
         <View style={styles.onboardingOverlay}>
@@ -3926,10 +3998,19 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
             </Pressable>
           ))}
         </View>
+        {adminAvailable ? (
+          <Pressable
+            style={styles.adminToolbarButton}
+            onPress={openAdminPanel}
+          >
+            <Text style={styles.adminToolbarButtonText}>Admin</Text>
+          </Pressable>
+        ) : null}
       </View>
 
-      <View style={styles.layout}>
-        <View style={styles.sidePanel}>
+      {isReady ? (
+        <View style={styles.layout}>
+          <View style={styles.sidePanel}>
           <Text style={styles.panelTitle}>Status Log</Text>
           <Pressable
             style={styles.statusDropdown}
@@ -3998,20 +4079,49 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
                 ? `${mercyStatus.cooldownDaysRemaining} days remaining`
                 : 'Boost next chest'}
             </Text>
+            <Pressable
+              style={styles.infoLink}
+              onPress={() => setMercyInfoOpen((prev) => !prev)}
+            >
+              <Text style={styles.infoLinkText}>
+                {mercyInfoOpen ? 'Hide' : 'What is this?'}
+              </Text>
+            </Pressable>
+            {mercyInfoOpen ? (
+              <View style={styles.mercyInfo}>
+                <Text style={styles.mercyTitle}>Mercy</Text>
+                <Text style={styles.mercyBullet}>- Mercy is a rare safety net for missed days.</Text>
+                <Text style={styles.mercyBullet}>
+                  - It prevents a small drop from becoming a spiral.
+                </Text>
+                <Text style={styles.mercyBullet}>
+                  - It never deletes progress or identity.
+                </Text>
+                <Text style={styles.mercyFooter}>
+                  You can ignore it. It activates only when needed.
+                </Text>
+              </View>
+            ) : null}
+          </View>
+          </View>
+
+          <View style={styles.centerPanel}>
+            <View style={styles.centerRuneRing} pointerEvents="none" />
+            <View style={styles.centerHeader}>
+              <Text style={styles.centerTitle}>{activeTab.toUpperCase()}</Text>
+            </View>
+
+            <ScrollView
+              style={styles.centerScroll}
+              contentContainerStyle={styles.centerScrollContent}
+            >
+              <View style={styles.contentColumn}>{mainContent}</View>
+            </ScrollView>
           </View>
         </View>
-
-      <View style={styles.centerPanel}>
-        <View style={styles.centerRuneRing} pointerEvents="none" />
-        <View style={styles.centerHeader}>
-          <Text style={styles.centerTitle}>{activeTab.toUpperCase()}</Text>
-          </View>
-
-          <ScrollView style={styles.centerScroll} contentContainerStyle={styles.centerScrollContent}>
-            <View style={styles.contentColumn}>{mainContent}</View>
-          </ScrollView>
-        </View>
-      </View>
+      ) : (
+        loadingContent
+      )}
     </View>
   );
 }
@@ -4125,6 +4235,22 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontWeight: '700',
   },
+  adminToolbarButton: {
+    marginLeft: 12,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    backgroundColor: '#0a152c',
+  },
+  adminToolbarButtonText: {
+    color: '#9fd6ff',
+    fontSize: 11,
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+    fontWeight: '700',
+  },
   layout: {
     flex: 1,
     flexDirection: 'row',
@@ -4163,6 +4289,45 @@ const styles = StyleSheet.create({
   sideMeta: {
     color: '#9bb3d6',
     fontSize: FONT.sm,
+  },
+  infoLink: {
+    marginTop: 8,
+    alignSelf: 'flex-start',
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    backgroundColor: '#0a152c',
+  },
+  infoLinkText: {
+    color: '#9fd6ff',
+    fontSize: 11,
+    letterSpacing: 0.4,
+  },
+  mercyInfo: {
+    marginTop: 8,
+    padding: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    backgroundColor: '#0b152a',
+  },
+  mercyTitle: {
+    color: '#eaf4ff',
+    fontSize: 12,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  mercyBullet: {
+    color: '#c7e2ff',
+    fontSize: 11,
+    marginBottom: 4,
+  },
+  mercyFooter: {
+    color: '#9bb3d6',
+    fontSize: 11,
+    marginTop: 6,
   },
   sideVitalsRow: {
     flexDirection: 'row',
@@ -4522,104 +4687,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
-  habitDetailOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(4, 8, 18, 0.82)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    zIndex: 60,
-    padding: 24,
-  },
-  habitDetailCard: {
-    width: '100%',
-    maxWidth: 420,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: '#7bc7ff',
-    backgroundColor: '#0c1732',
-    padding: 20,
-    gap: 10,
-  },
-  habitDetailTitle: {
-    color: '#eaf4ff',
-    fontSize: 18,
-    fontWeight: '700',
-  },
-  habitDetailMeta: {
-    color: '#9bb3d6',
-    fontSize: 12,
-  },
-  habitDetailActions: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  habitDetailPrimaryButton: {
-    flexGrow: 1,
-    borderRadius: 10,
-    paddingVertical: 10,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#79d2ff',
-    backgroundColor: '#1e63b8',
-  },
-  habitDetailPrimaryText: {
-    color: '#eaf4ff',
-    fontWeight: '700',
-    fontSize: 13,
-  },
-  habitDetailSecondaryButton: {
-    borderRadius: 10,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#2b4a78',
-    backgroundColor: '#0a152c',
-  },
-  habitDetailSecondaryText: {
-    color: '#c7e2ff',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  habitDetailDeleteButton: {
-    borderRadius: 10,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#7a2c3b',
-    backgroundColor: '#1a0f1f',
-  },
-  habitDetailDeleteText: {
-    color: '#f2b8c6',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  habitDetailSectionLabel: {
-    color: '#9fe1ff',
-    fontSize: 11,
-    letterSpacing: 0.8,
-    textTransform: 'uppercase',
-    marginTop: 6,
-  },
-  habitDetailInput: {
-    borderWidth: 1,
-    borderColor: '#2b4a78',
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: '#eaf4ff',
-    backgroundColor: '#0a152c',
-  },
-  habitDetailLog: {
-    color: '#c7e2ff',
-    fontSize: 12,
-  },
   adminPaletteOverlay: {
     position: 'absolute',
     top: 0,
@@ -4946,6 +5013,79 @@ const styles = StyleSheet.create({
     backgroundColor: '#0b1a33',
     padding: 16,
     marginBottom: 12,
+  },
+  encounterCard: {
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#7bc7ff',
+    backgroundColor: '#0b1a33',
+    padding: 16,
+    marginBottom: 12,
+  },
+  encounterHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  encounterLabel: {
+    color: '#9bb3d6',
+    fontSize: 11,
+    letterSpacing: 1.1,
+    textTransform: 'uppercase',
+  },
+  encounterBadge: {
+    borderRadius: 999,
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    backgroundColor: '#0a152c',
+  },
+  encounterBadgeText: {
+    color: '#9fd6ff',
+    fontSize: 10,
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+  },
+  encounterTitle: {
+    color: '#eaf4ff',
+    fontSize: 18,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  encounterHelper: {
+    color: '#c7e2ff',
+    fontSize: 12,
+    marginBottom: 12,
+  },
+  collapseCard: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    backgroundColor: '#0a152c',
+    padding: 12,
+    marginBottom: 12,
+  },
+  collapseHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  collapseTitle: {
+    color: '#9fe1ff',
+    fontSize: 12,
+    letterSpacing: 1.1,
+    textTransform: 'uppercase',
+  },
+  collapseAction: {
+    color: '#9bb3d6',
+    fontSize: 11,
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+  },
+  collapseBody: {
+    marginTop: 12,
   },
   primaryActionLabel: {
     color: '#9bb3d6',
@@ -5440,7 +5580,7 @@ const styles = StyleSheet.create({
   noteInput: {
     marginBottom: 8,
   },
-  combatRow: {
+  ritualRow: {
     marginTop: 12,
   },
   buttonGhost: {
