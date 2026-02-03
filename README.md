@@ -11,6 +11,21 @@
 - Backups (Supabase) are optional; auto-backup runs when signed in and logging effort.
 - Backup encryption (optional) is available on web via a passphrase field in Help > Account.
 
+## Phase 2 enablement (staging/production)
+Phase 2 is controlled by the environment variable:
+- `EXPO_PUBLIC_PHASE2_ENABLED=true`
+
+### Provider checklist (set `EXPO_PUBLIC_PHASE2_ENABLED=true`)
+- Expo/EAS Build profiles
+- Vercel (web deployments)
+- Netlify (web deployments)
+- Render/Fly/other hosting platforms
+- Local `.env`
+
+### Notes
+- Expo reads `EXPO_PUBLIC_*` at build time; ensure the variable is present in the build environment.
+- Add provider-specific instructions here once deployment targets are finalized.
+
 ## Security notes
 - Never store secrets in `EXPO_PUBLIC_*` env vars; those are shipped to clients.
 - Admin email allowlists only gate UI visibility. Real access control must be enforced by Supabase RLS.

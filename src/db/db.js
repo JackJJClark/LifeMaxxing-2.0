@@ -1051,6 +1051,241 @@ export async function adminGrantCard({ cardKey, qty = 1 } = {}) {
   };
 }
 
+export async function adminGrantExp({ amount = 0 } = {}) {
+  const delta = Number.parseInt(amount, 10) || 0;
+  if (delta <= 0) return;
+  if (isWeb) {
+    if (!webStore.identity) return;
+    const nextTotal = webStore.identity.totalEffortUnits + delta;
+    const computedLevel = Math.floor(nextTotal / EFFORT_UNITS_PER_LEVEL) + 1;
+    webStore.identity.totalEffortUnits = nextTotal;
+    webStore.identity.level = Math.max(webStore.identity.level, computedLevel);
+    webStore.identity.lastActiveAt = nowIso();
+    saveWebStore();
+    return;
+  }
+  const result = await execSql('SELECT id, totalEffortUnits, level FROM identity LIMIT 1');
+  if (result.rows.length === 0) return;
+  const identity = result.rows.item(0);
+  const nextTotal = identity.totalEffortUnits + delta;
+  const computedLevel = Math.floor(nextTotal / EFFORT_UNITS_PER_LEVEL) + 1;
+  const nextLevel = Math.max(identity.level, computedLevel);
+  await execSql(
+    'UPDATE identity SET totalEffortUnits = ?, level = ?, lastActiveAt = ? WHERE id = ?',
+    [nextTotal, nextLevel, nowIso(), identity.id]
+  );
+}
+
+export async function adminForceLevelUp({ levels = 1 } = {}) {
+  const bump = Math.max(1, Number.parseInt(levels, 10) || 1);
+  if (isWeb) {
+    if (!webStore.identity) return;
+    const nextLevel = webStore.identity.level + bump;
+    const minTotal = (nextLevel - 1) * EFFORT_UNITS_PER_LEVEL;
+    webStore.identity.level = nextLevel;
+    webStore.identity.totalEffortUnits = Math.max(webStore.identity.totalEffortUnits, minTotal);
+    webStore.identity.lastActiveAt = nowIso();
+    saveWebStore();
+    return;
+  }
+  const result = await execSql('SELECT id, totalEffortUnits, level FROM identity LIMIT 1');
+  if (result.rows.length === 0) return;
+  const identity = result.rows.item(0);
+  const nextLevel = identity.level + bump;
+  const minTotal = (nextLevel - 1) * EFFORT_UNITS_PER_LEVEL;
+  await execSql(
+    'UPDATE identity SET totalEffortUnits = ?, level = ?, lastActiveAt = ? WHERE id = ?',
+    [Math.max(identity.totalEffortUnits, minTotal), nextLevel, nowIso(), identity.id]
+  );
+}
+
+export async function adminResetLevel() {
+  if (isWeb) {
+    if (!webStore.identity) return;
+    webStore.identity.level = 1;
+    webStore.identity.totalEffortUnits = 0;
+    webStore.identity.lastActiveAt = nowIso();
+    saveWebStore();
+    return;
+  }
+  const result = await execSql('SELECT id FROM identity LIMIT 1');
+  if (result.rows.length === 0) return;
+  const identity = result.rows.item(0);
+  await execSql(
+    'UPDATE identity SET totalEffortUnits = ?, level = ?, lastActiveAt = ? WHERE id = ?',
+    [0, 1, nowIso(), identity.id]
+  );
+}
+
+export async function adminCompleteQuest({ arcId }) {
+  if (!arcId) throw new Error('Arc quest id required.');
+  const quest = ARC_QUESTS.find((item) => item.id === arcId);
+  if (!quest) throw new Error('Arc quest not found.');
+  const maxProgress = Math.max(...quest.milestones);
+  const unlockedCount = quest.fragments.length;
+  const updatedAt = nowIso();
+  if (isWeb) {
+    const existing = webStore.arcQuestProgress.find((item) => item.arcId === arcId);
+    if (existing) {
+      existing.progress = maxProgress;
+      existing.unlockedCount = unlockedCount;
+      existing.accepted = 1;
+      existing.ignored = 0;
+      existing.updatedAt = updatedAt;
+    } else {
+      webStore.arcQuestProgress.push({
+        arcId,
+        progress: maxProgress,
+        unlockedCount,
+        accepted: 1,
+        ignored: 0,
+        habitId: null,
+        updatedAt,
+      });
+    }
+    saveWebStore();
+    return;
+  }
+  await execSql(
+    `INSERT INTO arc_quest_progress (arcId, progress, unlockedCount, accepted, ignored, habitId, updatedAt)
+     VALUES (?, ?, ?, 1, 0, NULL, ?)
+     ON CONFLICT(arcId) DO UPDATE SET
+       progress=excluded.progress,
+       unlockedCount=excluded.unlockedCount,
+       accepted=1,
+       ignored=0,
+       habitId=NULL,
+       updatedAt=excluded.updatedAt`,
+    [arcId, maxProgress, unlockedCount, updatedAt]
+  );
+}
+
+export async function adminResetQuestProgress({ arcId } = {}) {
+  const updatedAt = nowIso();
+  if (isWeb) {
+    if (arcId) {
+      const record = webStore.arcQuestProgress.find((item) => item.arcId === arcId);
+      if (record) {
+        record.progress = 0;
+        record.unlockedCount = 0;
+        record.accepted = 0;
+        record.ignored = 0;
+        record.habitId = null;
+        record.updatedAt = updatedAt;
+      }
+    } else {
+      webStore.arcQuestProgress.forEach((record) => {
+        record.progress = 0;
+        record.unlockedCount = 0;
+        record.accepted = 0;
+        record.ignored = 0;
+        record.habitId = null;
+        record.updatedAt = updatedAt;
+      });
+    }
+    saveWebStore();
+    return;
+  }
+  if (arcId) {
+    await execSql(
+      'UPDATE arc_quest_progress SET progress = 0, unlockedCount = 0, accepted = 0, ignored = 0, habitId = NULL, updatedAt = ? WHERE arcId = ?',
+      [updatedAt, arcId]
+    );
+    return;
+  }
+  await execSql(
+    'UPDATE arc_quest_progress SET progress = 0, unlockedCount = 0, accepted = 0, ignored = 0, habitId = NULL, updatedAt = ?',
+    [updatedAt]
+  );
+}
+
+export async function adminSimulateMissedDays({ days = 0 } = {}) {
+  const delta = Math.max(0, Number.parseInt(days, 10) || 0);
+  const target = new Date();
+  target.setDate(target.getDate() - delta);
+  const iso = target.toISOString();
+  if (isWeb) {
+    if (!webStore.identity) return;
+    webStore.identity.lastActiveAt = iso;
+    saveWebStore();
+    return;
+  }
+  const result = await execSql('SELECT id FROM identity LIMIT 1');
+  if (result.rows.length === 0) return;
+  const identity = result.rows.item(0);
+  await execSql('UPDATE identity SET lastActiveAt = ? WHERE id = ?', [iso, identity.id]);
+}
+
+export async function adminResetToday() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (isWeb) {
+    const keepEfforts = webStore.effortLogs.filter(
+      (log) => log.timestamp.slice(0, 10) !== today
+    );
+    const removedEfforts = webStore.effortLogs.filter(
+      (log) => log.timestamp.slice(0, 10) === today
+    );
+    const removedChestIds = webStore.chests
+      .filter((chest) => chest.earnedAt.slice(0, 10) === today)
+      .map((chest) => chest.id);
+    webStore.effortLogs = keepEfforts;
+    webStore.chests = webStore.chests.filter(
+      (chest) => !removedChestIds.includes(chest.id)
+    );
+    webStore.chestMeta = webStore.chestMeta.filter(
+      (meta) => !removedChestIds.includes(meta.chestId)
+    );
+    const removedRewards = webStore.chestRewards.filter((reward) =>
+      removedChestIds.includes(reward.chestId)
+    );
+    const removedItemIds = removedRewards.map((reward) => reward.itemId).filter(Boolean);
+    const removedCardIds = removedRewards.map((reward) => reward.rewardId).filter(Boolean);
+    webStore.chestRewards = webStore.chestRewards.filter(
+      (reward) => !removedChestIds.includes(reward.chestId)
+    );
+    webStore.items = webStore.items.filter((item) => !removedItemIds.includes(item.id));
+    webStore.cards = webStore.cards.filter((card) => !removedCardIds.includes(card.id));
+    webStore.combatEncounters = webStore.combatEncounters.filter(
+      (encounter) => !removedChestIds.includes(encounter.chestId)
+    );
+    saveWebStore();
+    return { removedEfforts: removedEfforts.length };
+  }
+  const chestResult = await execSql('SELECT id FROM chests WHERE DATE(earnedAt) = ?', [today]);
+  const chestIds = [];
+  for (let i = 0; i < chestResult.rows.length; i += 1) {
+    chestIds.push(chestResult.rows.item(i).id);
+  }
+  if (chestIds.length > 0) {
+    const placeholders = chestIds.map(() => '?').join(',');
+    const rewardsResult = await execSql(
+      `SELECT itemId, rewardId FROM chest_rewards WHERE chestId IN (${placeholders})`,
+      chestIds
+    );
+    const itemIds = [];
+    const cardIds = [];
+    for (let i = 0; i < rewardsResult.rows.length; i += 1) {
+      const row = rewardsResult.rows.item(i);
+      if (row.itemId) itemIds.push(row.itemId);
+      if (row.rewardId) cardIds.push(row.rewardId);
+    }
+    await execSql(`DELETE FROM chest_rewards WHERE chestId IN (${placeholders})`, chestIds);
+    await execSql(`DELETE FROM chest_meta WHERE chestId IN (${placeholders})`, chestIds);
+    await execSql(`DELETE FROM combat_encounters WHERE chestId IN (${placeholders})`, chestIds);
+    await execSql(`DELETE FROM chests WHERE id IN (${placeholders})`, chestIds);
+    if (itemIds.length > 0) {
+      const itemPlaceholders = itemIds.map(() => '?').join(',');
+      await execSql(`DELETE FROM items WHERE id IN (${itemPlaceholders})`, itemIds);
+    }
+    if (cardIds.length > 0) {
+      const cardPlaceholders = cardIds.map(() => '?').join(',');
+      await execSql(`DELETE FROM cards WHERE id IN (${cardPlaceholders})`, cardIds);
+    }
+  }
+  await execSql('DELETE FROM effort_logs WHERE DATE(timestamp) = ?', [today]);
+  return { removedChests: chestIds.length };
+}
+
 async function getHabitNameById(habitId) {
   if (!habitId) return '';
   if (isWeb) {

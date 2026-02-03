@@ -1,7 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { StyleSheet, Text, View, Pressable, TextInput, ScrollView, Platform, Image } from 'react-native';
+﻿import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  StyleSheet,
+  Text,
+  View,
+  Pressable,
+  TextInput,
+  ScrollView,
+  Platform,
+  Image,
+  Animated,
+} from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { ADMIN_EMAILS, TURNSTILE_SITE_KEY, TURNSTILE_VERIFY_URL, isAdminEmail } from '../config';
+import { TURNSTILE_SITE_KEY, TURNSTILE_VERIFY_URL, PHASE2_ENABLED } from '../config';
 import { supabase } from '../services/supabase';
 import {
   signInWithPassword,
@@ -49,7 +59,6 @@ import {
   logEffort,
   resolveCombatEncounter,
   setHabitActive,
-  getHabitEffortForName,
   deleteHabit,
   acceptArcQuest,
   ignoreArcQuest,
@@ -59,8 +68,16 @@ import {
   adminOpenChest,
   adminUnlockAllChestRewards,
   adminGrantCard,
+  adminGrantExp,
+  adminForceLevelUp,
+  adminResetLevel,
+  adminCompleteQuest,
+  adminResetQuestProgress,
+  adminSimulateMissedDays,
+  adminResetToday,
   getEquippedCardId,
 } from '../db/db';
+import { SEASON_MANIFEST } from '../data/seasonManifest';
 
 const TOP_BAR_HEIGHT = Platform.OS === 'web' ? 80 : 88;
 const BRAND_BOX_SIZE = Platform.OS === 'web' ? 56 : 64;
@@ -78,8 +95,16 @@ const ACCENT_GOLD = '#f6c46a';
 const ENCRYPTION_VERSION = 1;
 const TURNSTILE_SCRIPT_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
 const BACKUP_HISTORY_KEY = 'lifemaxing.backupHistory.v1';
-const ADMIN_TOOL_RARITIES = ['common', 'uncommon', 'rare', 'epic', 'relic'];
-const ADMIN_TOOL_TIERS = ['weathered', 'sealed', 'engraved', 'runed', 'ancient'];
+const EXP_UNITS_PER_LEVEL = 10;
+const EXP_NOTES_KEY = 'lifemaxing.expNotesEnabled.v1';
+const HABIT_NOTES_KEY = 'lifemaxing.habitNotes.v1';
+const RARITY_COLORS = {
+  common: '#7aa2d6',
+  uncommon: '#6fd0ff',
+  rare: '#f6c46a',
+  epic: '#d3a6ff',
+  relic: '#ffd36a',
+};
 
 function TurnstileWidget({ onToken, onError }) {
   const containerRef = useRef(null);
@@ -251,15 +276,6 @@ async function decryptPayload(passphrase, envelope) {
 export default function StatusScreen() {
   const SHOW_TRUST_TESTS = true;
   const QUIET_MODE_DAYS = 2;
-  const BASE_TABS = [
-    'Tasks',
-    'Inventory',
-    'Shops',
-    'Party',
-    'Group',
-    'Challenges',
-    'Help',
-  ];
   const [loading, setLoading] = useState(true);
   const [snapshot, setSnapshot] = useState(null);
   const [habits, setHabits] = useState([]);
@@ -271,9 +287,10 @@ export default function StatusScreen() {
   const [cards, setCards] = useState([]);
   const [efforts, setEfforts] = useState([]);
   const [effortFilter, setEffortFilter] = useState('all');
-  const [effortInfo, setEffortInfo] = useState(null);
-  const [effortNote, setEffortNote] = useState('');
-  const [habitEfforts, setHabitEfforts] = useState({});
+  const [habitLogNote, setHabitLogNote] = useState('');
+  const [habitNotes, setHabitNotes] = useState({});
+  const [expNotesEnabled, setExpNotesEnabled] = useState(false);
+  const [expNoteMessage, setExpNoteMessage] = useState('');
   const [habitActionCounts, setHabitActionCounts] = useState({});
   const [evidence, setEvidence] = useState(null);
   const [combatChest, setCombatChest] = useState(null);
@@ -313,7 +330,6 @@ export default function StatusScreen() {
   const [adminAuditPage, setAdminAuditPage] = useState(0);
   const [adminDateFrom, setAdminDateFrom] = useState('');
   const [adminDateTo, setAdminDateTo] = useState('');
-  const [adminTab, setAdminTab] = useState('Overview');
   const [helpTab, setHelpTab] = useState('Account');
   const [backupPreview, setBackupPreview] = useState(null);
   const [backupPreviewPayload, setBackupPreviewPayload] = useState(null);
@@ -332,66 +348,48 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   const [orientationAccepted, setOrientationAccepted] = useState(false);
   const [orientationIgnored, setOrientationIgnored] = useState(false);
   const [orientationMessage, setOrientationMessage] = useState('');
-  const [showAdminTools, setShowAdminTools] = useState(false);
-  const [adminToolRarity, setAdminToolRarity] = useState('common');
-  const [adminToolTier, setAdminToolTier] = useState('weathered');
-  const [adminToolQuantity, setAdminToolQuantity] = useState('1');
-  const [adminToolForcedRewards, setAdminToolForcedRewards] = useState('');
-  const [adminToolMessage, setAdminToolMessage] = useState('');
-  const [adminToolChests, setAdminToolChests] = useState([]);
-  const [adminToolBusy, setAdminToolBusy] = useState(false);
-  const [adminToolCardKey, setAdminToolCardKey] = useState('');
-  const [adminToolCardQuantity, setAdminToolCardQuantity] = useState('1');
-  const [adminToolNotice, setAdminToolNotice] = useState('');
+  const [adminPaletteOpen, setAdminPaletteOpen] = useState(false);
+  const [adminPaletteQuery, setAdminPaletteQuery] = useState('');
+  const [adminPaletteSelection, setAdminPaletteSelection] = useState(null);
+  const [adminPaletteMessage, setAdminPaletteMessage] = useState('');
+  const [adminPaletteBusy, setAdminPaletteBusy] = useState(false);
+  const [adminPaletteParams, setAdminPaletteParams] = useState({});
+  const [adminSeasonLocks, setAdminSeasonLocks] = useState({});
+  const [adminRevealedCards, setAdminRevealedCards] = useState({});
+  const [adminPhaseOverride, setAdminPhaseOverride] = useState(null);
+  const [adminTapCount, setAdminTapCount] = useState(0);
+  const [adminTapAt, setAdminTapAt] = useState(0);
   const [equippedCardId, setEquippedCardId] = useState(null);
   const [selectedChallengeHabitId, setSelectedChallengeHabitId] = useState(null);
+  const [gallerySelection, setGallerySelection] = useState(null);
+  const [habitDetailId, setHabitDetailId] = useState(null);
+  const [showAllArcQuests, setShowAllArcQuests] = useState(false);
+  const [chestNotice, setChestNotice] = useState(null);
+  const phase2Active = adminPhaseOverride === null ? PHASE2_ENABLED : adminPhaseOverride === 'on';
+  const BASE_TABS = useMemo(
+    () => [
+      'Tasks',
+      'Inventory',
+      ...(phase2Active ? ['Gallery'] : []),
+      'Shops',
+      'Party',
+      'Group',
+      'Quests',
+      'Help',
+    ],
+    [phase2Active]
+  );
 
-  const TASK_SECTIONS = [
-    { key: 'status', label: 'STATUS' },
-    { key: 'quests', label: 'QUESTS' },
-    { key: 'skills', label: 'SKILLS' },
-    { key: 'equip', label: 'EQUIP' },
-  ];
-  const TASK_SECTION_KEY = 'lifemaxing.activeTaskSection.v1';
-  const [activeTaskSection, setActiveTaskSection] = useState(TASK_SECTIONS[0].key);
+  const newHabitInputRef = useRef(null);
+  const expAnim = useRef(new Animated.Value(0));
+  const expNoteTimeoutRef = useRef(null);
+  const lastEffortTotalRef = useRef(0);
 
-  useEffect(() => {
-    let alive = true;
-    async function restoreSection() {
-      try {
-        const stored = await AsyncStorage.getItem(TASK_SECTION_KEY);
-        if (!alive || !stored) return;
-        if (TASK_SECTIONS.some((section) => section.key === stored)) {
-          setActiveTaskSection(stored);
-        }
-      } catch (error) {
-        // ignore
-      }
-    }
-    restoreSection();
-    return () => {
-      alive = false;
-    };
-  }, []);
+  // Task sub-tabs removed to keep navigation singular (global tabs only).
 
-  async function handleTaskSectionChange(key) {
-    setActiveTaskSection(key);
-    try {
-      await AsyncStorage.setItem(TASK_SECTION_KEY, key);
-    } catch (error) {
-      // ignore
-    }
-  }
-
-  const adminEnabled = ADMIN_EMAILS.length > 0;
   const authEnabled = !!supabase;
-  const showAdminTab = Platform.OS === 'web' && adminEnabled;
-  const navTabs = useMemo(() => {
-    const tabs = [...BASE_TABS];
-    if (showAdminTab) tabs.push('Admin');
-    return tabs;
-  }, [showAdminTab]);
-  const ADMIN_TABS = ['Overview', 'Backups', 'Logs'];
+  const adminAvailable = authStatus === 'signed_in' && adminClaim === true;
+  const navTabs = BASE_TABS;
   const HELP_TABS = ['Account', 'Backups', 'Local', 'Onboarding', 'Trust'];
 
   async function refresh() {
@@ -401,7 +399,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     const habitList = await listHabits();
     const chestList = await listChests(5);
       const itemList = await listItems(20);
-      const cardList = await listCards(20);
+      const cardList = await listCards(phase2Active ? 200 : 20);
       const effortList = await listRecentEfforts({
         limit: 6,
         habitId: effortFilter === 'all' ? null : effortFilter,
@@ -421,17 +419,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
       const currentEquipped = await getEquippedCardId();
       setEquippedCardId(currentEquipped);
       await refreshArcQuests();
-      if (habitList.length > 0) {
-        const effortEntries = await Promise.all(
-          habitList.map(async (habit) => {
-            const info = await getHabitEffortForName(habit.name);
-            return [habit.id, info];
-          })
-        );
-        setHabitEfforts(Object.fromEntries(effortEntries));
-      } else {
-        setHabitEfforts({});
-      }
       if (!habitId && habitList.length > 0) {
         const active = habitList.find((habit) => habit.isActive);
         setHabitId(active ? active.id : habitList[0].id);
@@ -514,7 +501,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     if (!authEnabled || !EMAIL_AUTH_ENABLED) {
       setAuthStatus('disabled');
       setAuthEmail('');
-      setAdminStatus(adminEnabled ? 'signed_out' : 'disabled');
+      setAdminStatus('disabled');
       setAdminClaim(null);
       setLastBackupAt(null);
       await refreshBackupHistory();
@@ -530,7 +517,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     if (!data.session) {
       setAuthStatus('signed_out');
       setAuthEmail('');
-      setAdminStatus(adminEnabled ? 'signed_out' : 'disabled');
+      setAdminStatus('signed_out');
       setAdminClaim(null);
       setLastBackupAt(null);
       await refreshBackupHistory();
@@ -544,12 +531,9 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     const claim = data.session.user?.app_metadata?.is_admin;
     setAuthStatus('signed_in');
     setAuthEmail(sessionEmail);
-    setAdminClaim(typeof claim === 'boolean' ? claim : null);
-    if (adminEnabled && isAdminEmail(sessionEmail)) {
-      setAdminStatus('signed_in');
-    } else {
-      setAdminStatus(adminEnabled ? 'signed_out' : 'disabled');
-    }
+    const isAdminClaim = typeof claim === 'boolean' ? claim : null;
+    setAdminClaim(isAdminClaim);
+    setAdminStatus(isAdminClaim ? 'signed_in' : 'signed_out');
     try {
       await upsertUserProfile({ email: sessionEmail });
     } catch (error) {
@@ -582,7 +566,10 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     try {
       const stored = window.localStorage.getItem('lifemaxing.activeTab');
       if (stored) {
-        setActiveTab(stored);
+        const normalizedTab = stored === 'Challenges' ? 'Quests' : stored;
+        if (BASE_TABS.includes(normalizedTab)) {
+          setActiveTab(normalizedTab);
+        }
       }
     } catch (error) {
       // Ignore storage errors.
@@ -602,6 +589,66 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   }, []);
 
   useEffect(() => {
+    let alive = true;
+    async function restoreExpNotes() {
+      if (Platform.OS === 'web') {
+        try {
+          const stored = window.localStorage.getItem(EXP_NOTES_KEY);
+          if (!alive || stored === null) return;
+          setExpNotesEnabled(stored === 'true');
+          return;
+        } catch (error) {
+          return;
+        }
+      }
+      try {
+        const stored = await AsyncStorage.getItem(EXP_NOTES_KEY);
+        if (!alive || stored === null) return;
+        setExpNotesEnabled(stored === 'true');
+      } catch (error) {
+        // Ignore storage errors.
+      }
+    }
+    restoreExpNotes();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    async function restoreHabitNotes() {
+      if (Platform.OS === 'web') {
+        try {
+          const stored = window.localStorage.getItem(HABIT_NOTES_KEY);
+          if (!alive || !stored) return;
+          const parsed = JSON.parse(stored);
+          if (parsed && typeof parsed === 'object') {
+            setHabitNotes(parsed);
+          }
+          return;
+        } catch (error) {
+          return;
+        }
+      }
+      try {
+        const stored = await AsyncStorage.getItem(HABIT_NOTES_KEY);
+        if (!alive || !stored) return;
+        const parsed = JSON.parse(stored);
+        if (parsed && typeof parsed === 'object') {
+          setHabitNotes(parsed);
+        }
+      } catch (error) {
+        // Ignore storage errors.
+      }
+    }
+    restoreHabitNotes();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
     if (Platform.OS !== 'web') return;
     try {
       window.localStorage.setItem('lifemaxing.activeTab', activeTab);
@@ -609,6 +656,97 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
       // Ignore storage errors.
     }
   }, [activeTab]);
+
+  useEffect(() => () => {
+    if (expNoteTimeoutRef.current) {
+      clearTimeout(expNoteTimeoutRef.current);
+      expNoteTimeoutRef.current = null;
+    }
+  }, []);
+
+  const totalEffortUnits = snapshot?.identity?.totalEffortUnits || 0;
+  const expProgress =
+    EXP_UNITS_PER_LEVEL > 0 ? (totalEffortUnits % EXP_UNITS_PER_LEVEL) / EXP_UNITS_PER_LEVEL : 0;
+
+  useEffect(() => {
+    const duration = phase2Active ? 600 : 2000;
+    Animated.timing(expAnim.current, {
+      toValue: expProgress,
+      duration,
+      useNativeDriver: false,
+    }).start();
+  }, [expProgress]);
+
+  useEffect(() => {
+    if (!phase2Active || !expNotesEnabled) {
+      lastEffortTotalRef.current = totalEffortUnits;
+      return;
+    }
+    const prevTotal = lastEffortTotalRef.current;
+    if (totalEffortUnits > prevTotal) {
+      setExpNoteMessage('Progress noted');
+      if (expNoteTimeoutRef.current) {
+        clearTimeout(expNoteTimeoutRef.current);
+      }
+      expNoteTimeoutRef.current = setTimeout(() => {
+        setExpNoteMessage('');
+        expNoteTimeoutRef.current = null;
+      }, 2000);
+    }
+    lastEffortTotalRef.current = totalEffortUnits;
+  }, [totalEffortUnits, expNotesEnabled]);
+
+  useEffect(() => {
+    if (Platform.OS === 'web') {
+      try {
+        window.localStorage.setItem(EXP_NOTES_KEY, expNotesEnabled ? 'true' : 'false');
+        return;
+      } catch (error) {
+        // Ignore storage errors.
+      }
+    }
+    AsyncStorage.setItem(EXP_NOTES_KEY, expNotesEnabled ? 'true' : 'false').catch(() => {});
+  }, [expNotesEnabled]);
+
+  useEffect(() => {
+    const payload = JSON.stringify(habitNotes || {});
+    if (Platform.OS === 'web') {
+      try {
+        window.localStorage.setItem(HABIT_NOTES_KEY, payload);
+        return;
+      } catch (error) {
+        // Ignore storage errors.
+      }
+    }
+    AsyncStorage.setItem(HABIT_NOTES_KEY, payload).catch(() => {});
+  }, [habitNotes]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'web' || !adminAvailable) return;
+    function handleKeyDown(event) {
+      const key = event.key?.toLowerCase?.() || '';
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && key === 'a') {
+        event.preventDefault();
+        setAdminPaletteOpen(true);
+      }
+      if (key === 'escape') {
+        setAdminPaletteOpen(false);
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [adminAvailable]);
+
+  useEffect(() => {
+    if (adminAvailable || !adminPaletteOpen) return;
+    setAdminPaletteOpen(false);
+    setAdminPaletteQuery('');
+    setAdminPaletteSelection(null);
+    setAdminPaletteMessage('');
+    setAdminPaletteParams({});
+  }, [adminAvailable, adminPaletteOpen]);
 
   const selectedHabit = useMemo(
     () => habits.find((habit) => habit.id === habitId) || null,
@@ -619,10 +757,25 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     () => new Map(habits.map((habit) => [habit.id, habit])),
     [habits]
   );
-  const equippedCard = useMemo(
-    () => cards.find((card) => card.id === equippedCardId) || null,
-    [cards, equippedCardId]
-  );
+  useEffect(() => {
+    if (habitDetailId && !habitById.has(habitDetailId)) {
+      setHabitDetailId(null);
+    }
+  }, [habitDetailId, habitById]);
+  const galleryCardStats = useMemo(() => {
+    const counts = new Map();
+    const latest = new Map();
+    cards.forEach((card) => {
+      const key = card.cardKey;
+      if (!key) return;
+      counts.set(key, (counts.get(key) || 0) + 1);
+      const current = latest.get(key);
+      if (!current || new Date(card.earnedAt) > new Date(current.earnedAt)) {
+        latest.set(key, card);
+      }
+    });
+    return { counts, latest };
+  }, [cards]);
 
   const challengeHabit = useMemo(() => {
     if (!habits.length) return null;
@@ -681,35 +834,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   }, [habits]);
 
 
-  useEffect(() => {
-    let alive = true;
-    async function loadEffortInfo() {
-      if (!selectedHabit) {
-        setEffortInfo(null);
-        return;
-      }
-      const info = await getHabitEffortForName(selectedHabit.name);
-      if (alive) {
-        setEffortInfo(info);
-      }
-    }
-    loadEffortInfo();
-    return () => {
-      alive = false;
-    };
-  }, [selectedHabit?.name]);
-
-  useEffect(() => {
-    if (showAdminTab && activeTab === 'Admin' && adminBackups.length === 0) {
-      handleRefreshBackups();
-    }
-  }, [showAdminTab, activeTab]);
-
-  useEffect(() => {
-    if (showAdminTab && activeTab === 'Admin') {
-      handleRefreshAdminOverview();
-    }
-  }, [showAdminTab, activeTab]);
 
   const isQuietMode = inactivityDays >= QUIET_MODE_DAYS;
   const turnstileEnabled = Platform.OS === 'web' && !!TURNSTILE_SITE_KEY;
@@ -947,117 +1071,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     setOrientationAccepted(false);
   }
 
-  async function handleAdminSpawnChest(best = false) {
-    if (adminToolBusy) return;
-    const selectedRarity = best ? 'relic' : adminToolRarity;
-    const selectedTier = best ? 'ancient' : adminToolTier;
-    const quantity = Math.max(1, Math.min(10, Number.parseInt(adminToolQuantity, 10) || 1));
-    let parsedForced = null;
-    if (adminToolForcedRewards.trim()) {
-      try {
-        const parsed = JSON.parse(adminToolForcedRewards);
-        if (!Array.isArray(parsed)) {
-          throw new Error('Forced rewards must be an array.');
-        }
-        parsedForced = parsed;
-      } catch (error) {
-        setAdminToolMessage(error?.message || 'Invalid forced rewards configuration.');
-        return;
-      }
-    }
-    setAdminToolBusy(true);
-    setAdminToolMessage('');
-    try {
-      const spawned = await adminSpawnChest({
-        rarity: selectedRarity,
-        tier: selectedTier,
-        qty: quantity,
-        forcedRewards: parsedForced,
-      });
-      setAdminToolChests((prev) => [...spawned, ...prev].slice(0, 5));
-      setAdminToolMessage(`Spawned ${spawned.length} chest${spawned.length === 1 ? '' : 's'}.`);
-      if (best) {
-        setAdminToolRarity('relic');
-        setAdminToolTier('ancient');
-      }
-      await refresh();
-    } catch (error) {
-      setAdminToolMessage(error?.message || 'Failed to spawn chest.');
-    } finally {
-      setAdminToolBusy(false);
-    }
-  }
-
-  async function handleOpenAdminChest(chestId) {
-    if (adminToolBusy) return;
-    setAdminToolBusy(true);
-    try {
-      const chest = await adminOpenChest({ chestId });
-      setAdminToolChests((prev) =>
-        prev.map((entry) =>
-          entry.id === chestId
-            ? { ...entry, rewards: chest.rewards, lockedCount: chest.lockedCount }
-            : entry
-        )
-      );
-      setAdminToolMessage(`Loaded ${chest.rewards.length} reward${chest.rewards.length === 1 ? '' : 's'}.`);
-    } catch (error) {
-      setAdminToolMessage(error?.message || 'Failed to open chest.');
-    } finally {
-      setAdminToolBusy(false);
-    }
-  }
-
-  async function handleUnlockAdminChest(chestId) {
-    if (adminToolBusy) return;
-    setAdminToolBusy(true);
-    try {
-      const chest = await adminUnlockAllChestRewards({ chestId });
-      setAdminToolChests((prev) =>
-        prev.map((entry) =>
-          entry.id === chestId
-            ? {
-                ...entry,
-                rewards: chest.rewards,
-                lockedCount: 0,
-                unlockedRewardCount: chest.rewardCount,
-              }
-            : entry
-        )
-      );
-      setAdminToolMessage('Chest unlocked.');
-      await refresh();
-    } catch (error) {
-      setAdminToolMessage(error?.message || 'Failed to unlock chest.');
-    } finally {
-      setAdminToolBusy(false);
-    }
-  }
-
-  async function handleGrantAdminCard() {
-    if (adminToolBusy) return;
-    setAdminToolBusy(true);
-    setAdminToolNotice('');
-    try {
-      const qty = Math.max(1, Math.min(10, Number.parseInt(adminToolCardQuantity, 10) || 1));
-      const key = adminToolCardKey.trim() || 'return_signal';
-      const result = await adminGrantCard({ cardKey: key, qty });
-      let notice = `Granted ${result.grantedCount} card${result.grantedCount === 1 ? '' : 's'}.`;
-      if (result.autoEquippedCardId) {
-        notice += ' Auto-equipped.';
-      } else if (result.totalOwned >= 2) {
-        notice += ' Auto-equip paused (>=2 cards).';
-      }
-      setAdminToolNotice(notice);
-      setAdminToolMessage('Card grant applied.');
-      await refresh();
-    } catch (error) {
-      setAdminToolMessage(error?.message || 'Failed to grant card.');
-    } finally {
-      setAdminToolBusy(false);
-    }
-  }
-
   async function handleLogEffort({
     habitId: overrideHabitId,
     note: overrideNote = null,
@@ -1073,7 +1086,8 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     const actionConfig = getHabitActionConfig(targetHabit);
     const resolvedActionType = overrideActionType || actionConfig.actionType || 'custom';
     const resolvedUnits = overrideUnits ?? actionConfig.units ?? 1;
-    const noteSource = overrideNote !== null ? overrideNote : effortNote;
+    const noteSource =
+      overrideNote !== null && overrideNote !== undefined ? overrideNote : null;
     const cleanedNote = noteSource?.trim ? noteSource.trim() : '';
     const result = await logEffort({
       habitId: targetHabitId,
@@ -1083,13 +1097,14 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     });
     if (shouldShowOrientation) {
       await markOrientationComplete();
-      setOrientationMessage("You logged effort. That's all this system ever asks.");
+      setOrientationMessage("You logged an action. That's all this system ever asks.");
     }
     await refresh();
-    setEffortNote('');
+    setHabitLogNote('');
     if (result?.arcUnlocks?.length) {
       setArcOverlay(result.arcUnlocks[0]);
     }
+    setChestNotice({ chestId: result?.chestId || null, at: Date.now() });
     if (authStatus === 'signed_in') {
       try {
         const payload = await exportAllData();
@@ -1305,7 +1320,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
           localUpdatedAt: localLatest.toISOString(),
           remoteUpdatedAt: record.updated_at,
         });
-        setAccountMessage('Backup found. Local changes are newer — review before restoring.');
+        setAccountMessage('Backup found. Local changes are newer â€” review before restoring.');
       } else {
         setBackupConflict(null);
         setAccountMessage('Backup ready to restore. Review the preview below.');
@@ -1817,15 +1832,15 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
 
   function habitEmoji(name) {
     const text = name.toLowerCase();
-    if (text.includes('gym') || text.includes('lift') || text.includes('workout')) return '💪';
-    if (text.includes('run') || text.includes('cardio')) return '🏃';
-    if (text.includes('water') || text.includes('hydrate')) return '💧';
-    if (text.includes('sleep') || text.includes('bed')) return '😴';
-    if (text.includes('meditate') || text.includes('mind')) return '🧘';
-    if (text.includes('read')) return '📚';
-    if (text.includes('walk')) return '🚶';
-    if (text.includes('meal') || text.includes('protein') || text.includes('nutrition')) return '🥗';
-    return '⭐';
+    if (text.includes('gym') || text.includes('lift') || text.includes('workout')) return 'ðŸ’ª';
+    if (text.includes('run') || text.includes('cardio')) return 'ðŸƒ';
+    if (text.includes('water') || text.includes('hydrate')) return 'ðŸ’§';
+    if (text.includes('sleep') || text.includes('bed')) return 'ðŸ˜´';
+    if (text.includes('meditate') || text.includes('mind')) return 'ðŸ§˜';
+    if (text.includes('read')) return 'ðŸ“š';
+    if (text.includes('walk')) return 'ðŸš¶';
+    if (text.includes('meal') || text.includes('protein') || text.includes('nutrition')) return 'ðŸ¥—';
+    return 'â­';
   }
 
   async function handleCreateHabit() {
@@ -2032,16 +2047,330 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   const { identity, counts } = snapshot;
   const unlockedItems = items.filter((item) => !item.locked);
   const unlockedCards = cards.filter((card) => !card.locked);
+  const visibleCards = phase2Active ? unlockedCards : [];
+  const hasVisibleCards = visibleCards.length > 0;
   const activeHabits = habits.filter((habit) => habit.isActive).length;
   const pausedHabits = habits.length - activeHabits;
   const showTasks = activeTab === 'Tasks';
   const showInventory = activeTab === 'Inventory';
-  const showChallenges = activeTab === 'Challenges';
+  const showGallery = activeTab === 'Gallery';
+  const showQuests = activeTab === 'Quests';
   const showHelp = activeTab === 'Help';
-  const showAdmin = activeTab === 'Admin';
   const showPlaceholder = ['Shops', 'Party', 'Group'].includes(activeTab);
   const phase2Stats = computePhase2Stats();
   const identityTitle = getIdentityTitle(identity?.level || 1);
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const hasLoggedToday = efforts.some((effort) => {
+    if (!effort?.timestamp) return false;
+    return effort.timestamp.slice(0, 10) === todayKey;
+  });
+  const activeHabitList = habits.filter((habit) => habit.isActive);
+  const defaultHabit = activeHabitList[0] || habits[0] || null;
+  const hasLockedChest = Boolean(combatChest);
+  const primaryAction = (() => {
+    if (habits.length === 0) {
+      return {
+        title: 'Create your first habit',
+        helper: 'Start with something small and repeatable.',
+        cta: 'Create habit',
+        onPress: () => {
+          newHabitInputRef.current?.focus?.();
+        },
+      };
+    }
+    if (!hasLoggedToday) {
+      return {
+        title: 'Log one action',
+        helper: defaultHabit ? `Next up: ${defaultHabit.name}` : 'Log any habit action.',
+        cta: 'Log action',
+        onPress: () => {
+          if (defaultHabit) {
+            if (!defaultHabit.isActive) {
+              setHabitDetailId(defaultHabit.id);
+              return;
+            }
+            handleHabitAction(defaultHabit);
+          }
+        },
+      };
+    }
+    if (hasLockedChest) {
+      return {
+        title: 'Open chest',
+        helper: 'Rewards are ready to unlock.',
+        cta: 'Open chest',
+        onPress: () => setActiveTab('Inventory'),
+      };
+    }
+    if (phase2Active) {
+      return {
+        title: 'View your Gallery',
+        helper: 'See what you have uncovered so far.',
+        cta: 'Open Gallery',
+        onPress: () => setActiveTab('Gallery'),
+      };
+    }
+    return {
+      title: 'Review your inventory',
+      helper: 'Check your latest unlocks.',
+      cta: 'Open inventory',
+      onPress: () => setActiveTab('Inventory'),
+    };
+  })();
+  const currentArcQuest = arcQuests.find((quest) => quest.accepted) || arcQuests[0] || null;
+  const habitDetail = habitDetailId ? habitById.get(habitDetailId) : null;
+  const habitDetailLogs = habitDetail
+    ? [...efforts]
+        .filter((effort) => effort.habitId === habitDetail.id)
+        .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+        .slice(0, 5)
+    : [];
+  const habitDetailNote = habitDetail ? habitNotes[habitDetail.id] || '' : '';
+  const adminCommands = useMemo(() => {
+    const seasonOptions = SEASON_MANIFEST.map((season) => season.id);
+    const questOptions = arcQuests.map((quest) => quest.id);
+    const habitOptions = habits.map((habit) => habit.id);
+    const allCardKeys = SEASON_MANIFEST.flatMap((season) =>
+      season.cards.map((card) => card.key)
+    );
+    return [
+      {
+        id: 'grant_chest',
+        label: 'Grant chest',
+        params: [
+          { key: 'rarity', label: 'Rarity', placeholder: 'common' },
+          { key: 'tier', label: 'Tier', placeholder: 'weathered' },
+          { key: 'qty', label: 'Quantity', placeholder: '1' },
+        ],
+        run: async (params) => {
+          await adminSpawnChest({
+            rarity: params.rarity || 'common',
+            tier: params.tier || 'weathered',
+            qty: params.qty || 1,
+          });
+          await refresh();
+          return 'Chest granted.';
+        },
+      },
+      {
+        id: 'open_chest',
+        label: 'Open chest immediately',
+        run: async () => {
+          if (!combatChest?.id) return 'No locked chest found.';
+          await adminUnlockAllChestRewards({ chestId: combatChest.id });
+          await refresh();
+          return 'Chest unlocked.';
+        },
+      },
+      {
+        id: 'grant_card',
+        label: 'Grant specific card by ID',
+        params: [
+          { key: 'cardKey', label: 'Card Key', placeholder: 'return_signal' },
+          { key: 'qty', label: 'Quantity', placeholder: '1' },
+        ],
+        run: async (params) => {
+          await adminGrantCard({
+            cardKey: params.cardKey || 'return_signal',
+            qty: params.qty || 1,
+          });
+          await refresh();
+          return 'Card granted.';
+        },
+      },
+      {
+        id: 'reveal_random_card',
+        label: 'Reveal random card',
+        run: async () => {
+          const key = allCardKeys.length
+            ? allCardKeys[Math.floor(Math.random() * allCardKeys.length)]
+            : 'return_signal';
+          await adminGrantCard({ cardKey: key, qty: 1 });
+          await refresh();
+          return 'Random card granted.';
+        },
+      },
+      {
+        id: 'grant_exp',
+        label: 'Grant EXP',
+        params: [{ key: 'amount', label: 'Amount', placeholder: '5' }],
+        run: async (params) => {
+          await adminGrantExp({ amount: params.amount || 0 });
+          await refresh();
+          return 'EXP granted.';
+        },
+      },
+      {
+        id: 'force_level',
+        label: 'Force level up',
+        params: [{ key: 'levels', label: 'Levels', placeholder: '1' }],
+        run: async (params) => {
+          await adminForceLevelUp({ levels: params.levels || 1 });
+          await refresh();
+          return 'Level increased.';
+        },
+      },
+      {
+        id: 'reset_level',
+        label: 'Reset level / EXP',
+        run: async () => {
+          await adminResetLevel();
+          await refresh();
+          return 'Level reset.';
+        },
+      },
+      {
+        id: 'unlock_season',
+        label: 'Unlock season',
+        params: [{ key: 'seasonId', label: 'Season ID', placeholder: seasonOptions[0] || '' }],
+        run: async (params) => {
+          const seasonId = params.seasonId || seasonOptions[0];
+          if (!seasonId) return 'No season found.';
+          setAdminSeasonLocks((prev) => ({ ...prev, [seasonId]: false }));
+          return 'Season unlocked.';
+        },
+      },
+      {
+        id: 'lock_season',
+        label: 'Lock season',
+        params: [{ key: 'seasonId', label: 'Season ID', placeholder: seasonOptions[0] || '' }],
+        run: async (params) => {
+          const seasonId = params.seasonId || seasonOptions[0];
+          if (!seasonId) return 'No season found.';
+          setAdminSeasonLocks((prev) => ({ ...prev, [seasonId]: true }));
+          return 'Season locked.';
+        },
+      },
+      {
+        id: 'reveal_all_cards',
+        label: 'Reveal all cards in season',
+        params: [{ key: 'seasonId', label: 'Season ID', placeholder: seasonOptions[0] || '' }],
+        run: async (params) => {
+          const seasonId = params.seasonId || seasonOptions[0];
+          const season = SEASON_MANIFEST.find((item) => item.id === seasonId);
+          if (!season) return 'Season not found.';
+          setAdminRevealedCards((prev) => {
+            const next = { ...prev };
+            season.cards.forEach((card) => {
+              next[card.key] = true;
+            });
+            return next;
+          });
+          return 'Cards revealed.';
+        },
+      },
+      {
+        id: 'reset_season',
+        label: 'Reset season progress',
+        params: [{ key: 'seasonId', label: 'Season ID', placeholder: seasonOptions[0] || '' }],
+        run: async (params) => {
+          const seasonId = params.seasonId || seasonOptions[0];
+          const season = SEASON_MANIFEST.find((item) => item.id === seasonId);
+          if (!season) return 'Season not found.';
+          setAdminRevealedCards((prev) => {
+            const next = { ...prev };
+            season.cards.forEach((card) => {
+              delete next[card.key];
+            });
+            return next;
+          });
+          return 'Season reset.';
+        },
+      },
+      {
+        id: 'complete_quest',
+        label: 'Complete quest',
+        params: [{ key: 'arcId', label: 'Quest ID', placeholder: questOptions[0] || '' }],
+        run: async (params) => {
+          const arcId = params.arcId || questOptions[0];
+          if (!arcId) return 'No quest found.';
+          await adminCompleteQuest({ arcId });
+          await refreshArcQuests();
+          return 'Quest completed.';
+        },
+      },
+      {
+        id: 'reset_quest',
+        label: 'Reset quest progress',
+        params: [{ key: 'arcId', label: 'Quest ID', placeholder: questOptions[0] || '' }],
+        run: async (params) => {
+          await adminResetQuestProgress({ arcId: params.arcId || '' });
+          await refreshArcQuests();
+          return 'Quest reset.';
+        },
+      },
+      {
+        id: 'simulate_habit',
+        label: 'Simulate habit action',
+        params: [{ key: 'habitId', label: 'Habit ID', placeholder: habitOptions[0] || '' }],
+        run: async (params) => {
+          const targetHabit = habitById.get(params.habitId || '') || defaultHabit;
+          if (!targetHabit) return 'No habit found.';
+          await handleHabitAction(targetHabit);
+          return 'Habit action simulated.';
+        },
+      },
+      {
+        id: 'simulate_missed_days',
+        label: 'Simulate missed days',
+        params: [{ key: 'days', label: 'Days', placeholder: '3' }],
+        run: async (params) => {
+          await adminSimulateMissedDays({ days: params.days || 0 });
+          await refresh();
+          return 'Missed days simulated.';
+        },
+      },
+      {
+        id: 'toggle_reentry',
+        label: 'Toggle re-entry mode',
+        run: async () => {
+          await adminSimulateMissedDays({ days: isQuietMode ? 0 : QUIET_MODE_DAYS + 1 });
+          await refresh();
+          return `Re-entry ${isQuietMode ? 'disabled' : 'enabled'}.`;
+        },
+      },
+      {
+        id: 'toggle_phase',
+        label: 'Toggle phase flag (local override)',
+        run: async () => {
+          setAdminPhaseOverride((prev) => {
+            if (prev === 'on') return 'off';
+            if (prev === 'off') return 'on';
+            return PHASE2_ENABLED ? 'off' : 'on';
+          });
+          return 'Phase override toggled.';
+        },
+      },
+      {
+        id: 'reset_today',
+        label: "Reset today's state",
+        run: async () => {
+          await adminResetToday();
+          await refresh();
+          return 'Today reset.';
+        },
+      },
+      {
+        id: 'clear_cache',
+        label: 'Clear local cache',
+        run: async () => {
+          await clearAllData();
+          await initDb();
+          await getOrCreateIdentity();
+          await refresh();
+          return 'Local cache cleared.';
+        },
+      },
+      {
+        id: 'reload_state',
+        label: 'Reload app state',
+        run: async () => {
+          await refresh();
+          return 'State reloaded.';
+        },
+      },
+    ];
+  }, [arcQuests, habits, combatChest, habitById, defaultHabit, isQuietMode, phase2Active]);
 
   function getHabitTags(name) {
     const text = name.toLowerCase();
@@ -2100,7 +2429,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     const type = getHabitTypeFromName(habit?.name, habit?.type);
     if (type === 'gym') {
       return {
-        label: 'Log Session',
+        label: 'Log Gym Session',
         actionType: 'gym_session',
         units: 1,
         type,
@@ -2117,11 +2446,11 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
       };
     }
     return {
-      label: 'Log Effort',
+      label: 'Log Action',
       actionType: 'custom',
       units: 1,
       type,
-      summary: 'Effort',
+      summary: 'Action',
     };
   }
 
@@ -2161,6 +2490,112 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     } catch (error) {
       return { modifiers: [], tag: '' };
     }
+  }
+
+  function getRarityColor(rarity) {
+    if (!rarity) return RARITY_COLORS.common;
+    return RARITY_COLORS[rarity] || RARITY_COLORS.common;
+  }
+
+  function handleLogoTap() {
+    if (!adminAvailable) return;
+    const now = Date.now();
+    const windowMs = 1500;
+    const nextCount = now - adminTapAt > windowMs ? 1 : adminTapCount + 1;
+    setAdminTapAt(now);
+    setAdminTapCount(nextCount);
+    if (nextCount >= 5) {
+      setAdminTapCount(0);
+      setAdminPaletteOpen(true);
+    }
+  }
+
+  const filteredAdminCommands = adminCommands.filter((command) =>
+    command.label.toLowerCase().includes(adminPaletteQuery.toLowerCase())
+  );
+
+  async function handleRunAdminCommand(command) {
+    if (!adminAvailable || !command || adminPaletteBusy) return;
+    setAdminPaletteBusy(true);
+    setAdminPaletteMessage('');
+    try {
+      const result = await command.run(adminPaletteParams);
+      setAdminPaletteMessage(result || 'Command executed.');
+    } catch (error) {
+      setAdminPaletteMessage(error?.message || 'Command failed.');
+    } finally {
+      setAdminPaletteBusy(false);
+    }
+  }
+
+  function renderArcQuestCard(quest) {
+    if (!quest) return null;
+    const linkedHabit = habitById.get(quest.habitId);
+    return (
+      <View key={quest.id} style={styles.arcCard}>
+        <View style={styles.arcHeader}>
+          <Text style={styles.arcTitle}>{quest.title}</Text>
+          <Text style={styles.arcTheme}>{quest.theme}</Text>
+        </View>
+        <Text style={styles.subtle}>{quest.summary}</Text>
+        <View style={styles.arcProgressRow}>
+          <Text style={styles.arcProgressValue}>{quest.progress} effort</Text>
+          <Text style={styles.arcProgressMeta}>
+            {quest.unlockedCount}/{quest.totalFragments} fragments
+          </Text>
+        </View>
+        {quest.nextMilestone ? (
+          <Text style={styles.arcProgressMeta}>
+            Next fragment at {quest.nextMilestone} effort
+          </Text>
+        ) : (
+          <Text style={styles.arcProgressMeta}>All fragments unlocked.</Text>
+        )}
+        <View style={styles.arcControlRow}>
+          <Text style={styles.arcHint}>
+            Arc quests describe your journeyâ€”they never demand a daily task.
+          </Text>
+          {!quest.accepted && (
+            <View style={styles.arcButtonRow}>
+              <Pressable
+                style={[styles.buttonSmall, styles.arcAcceptButton]}
+                onPress={() => handleAcceptArc(quest.id)}
+              >
+                <Text style={styles.buttonText}>Accept quest</Text>
+              </Pressable>
+              {!quest.ignored && (
+                <Pressable style={styles.buttonGhost} onPress={() => handleIgnoreArc(quest.id)}>
+                  <Text style={styles.buttonGhostText}>Ignore for now</Text>
+                </Pressable>
+              )}
+            </View>
+          )}
+          {quest.accepted && (
+            <View style={styles.arcLinkRow}>
+              <Text style={styles.subtle}>
+                Linked Habit:&nbsp;
+                <Text style={{ color: ACCENT_GOLD }}>
+                  {linkedHabit ? linkedHabit.name : 'None yet'}
+                </Text>
+              </Text>
+              <Pressable
+                style={[styles.buttonSmall, styles.arcLinkButton]}
+                onPress={() => handleCycleArcHabit(quest)}
+              >
+                <Text style={styles.buttonText}>
+                  {linkedHabit ? 'Rebind habit' : 'Bind a habit'}
+                </Text>
+              </Pressable>
+            </View>
+          )}
+          {!quest.accepted && quest.ignored ? (
+            <Text style={styles.quietText}>
+              Ignored quietlyâ€”accept any time to re-open this narrative.
+            </Text>
+          ) : null}
+        </View>
+      </View>
+    );
   }
 
   function formatScopeTag(scope) {
@@ -2256,7 +2691,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     if (!effort) return 'No progress tracked yet.';
     const habit = habitById.get(effort.habitId);
     const name = habit?.name || effort.habitName || 'Habit';
-    const action = effort.actionType?.replace('_', ' ') || 'effort';
+    const action = effort.actionType?.replace('_', ' ') || 'action';
     const units = typeof effort.units === 'number' ? effort.units : effort.effortValue || 1;
     const timestamp = new Date(effort.timestamp).toLocaleDateString();
     return `Last logged ${action} for ${name} (${units} unit${units === 1 ? '' : 's'}) on ${timestamp}`;
@@ -2323,233 +2758,34 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
               <Text style={styles.subtle}>Future: shared metrics + sync.</Text>
             </>
           ) : null}
-          </View>
-      ) : null}
-
-      {showTasks && adminStatus === 'signed_in' && adminClaim ? (
-        <View style={styles.panel}>
-          <View style={styles.adminToolsHeader}>
-            <Text style={styles.panelTitle}>Admin Tools</Text>
-            <Pressable
-              style={styles.buttonGhost}
-              onPress={() => setShowAdminTools((prev) => !prev)}
-            >
-              <Text style={styles.buttonGhostText}>
-                {showAdminTools ? 'Hide tools' : 'Open admin tools'}
-              </Text>
-            </Pressable>
-          </View>
-          {adminToolMessage ? (
-            <Text style={styles.adminToolsMessage}>{adminToolMessage}</Text>
-          ) : null}
-          {!showAdminTools ? (
-            <Text style={styles.subtle}>Tap to open the admin console.</Text>
-          ) : (
-            <>
-              <View style={styles.adminToolsMetaRow}>
-                <Text style={styles.subtle}>
-                  Equipped card: {equippedCard?.name || equippedCardId || 'None yet'}
-                </Text>
-                <Text style={styles.subtle}>Cards shown: {cards.length}</Text>
-              </View>
-              <Text style={styles.panelSubtitle}>Chest Spawner</Text>
-              <View style={styles.adminToolsRow}>
-                {ADMIN_TOOL_RARITIES.map((option) => {
-                  const active = option === adminToolRarity;
-                  return (
-                    <Pressable
-                      key={option}
-                      style={[styles.adminToolsChip, active && styles.adminToolsChipActive]}
-                      onPress={() => setAdminToolRarity(option)}
-                    >
-                      <Text
-                        style={[
-                          styles.adminToolsChipText,
-                          active && styles.adminToolsChipTextActive,
-                        ]}
-                      >
-                        {option.toUpperCase()}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-              <View style={styles.adminToolsRow}>
-                {ADMIN_TOOL_TIERS.map((option) => {
-                  const active = option === adminToolTier;
-                  return (
-                    <Pressable
-                      key={option}
-                      style={[styles.adminToolsChip, active && styles.adminToolsChipActive]}
-                      onPress={() => setAdminToolTier(option)}
-                    >
-                      <Text
-                        style={[
-                          styles.adminToolsChipText,
-                          active && styles.adminToolsChipTextActive,
-                        ]}
-                      >
-                        {option}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-              <View style={styles.adminToolsRow}>
-                <TextInput
-                  style={styles.adminToolsInput}
-                  value={adminToolQuantity}
-                  onChangeText={setAdminToolQuantity}
-                  keyboardType="number-pad"
-                  placeholder="Quantity"
-                  editable={!adminToolBusy}
-                />
-              </View>
-              <View style={styles.adminToolsRow}>
-                <TextInput
-                  style={[styles.adminToolsInput, styles.adminToolsTextArea]}
-                  value={adminToolForcedRewards}
-                  onChangeText={setAdminToolForcedRewards}
-                  placeholder='Forced rewards JSON (optional)'
-                  multiline
-                  editable={!adminToolBusy}
-                />
-              </View>
-              <View style={styles.adminToolsButtonRow}>
-                <Pressable
-                  style={[styles.button, adminToolBusy && styles.buttonDisabled]}
-                  onPress={() => handleAdminSpawnChest(false)}
-                  disabled={adminToolBusy}
-                >
-                  <Text style={styles.buttonText}>Spawn Chest</Text>
-                </Pressable>
-                <Pressable
-                  style={[styles.buttonGhost, adminToolBusy && styles.buttonDisabled]}
-                  onPress={() => handleAdminSpawnChest(true)}
-                  disabled={adminToolBusy}
-                >
-                  <Text style={styles.buttonGhostText}>Spawn Best Chest</Text>
-                </Pressable>
-              </View>
-              <Text style={styles.panelSubtitle}>Chest List</Text>
-              {adminToolChests.length === 0 ? (
-                <Text style={styles.subtle}>Spawned chests appear here.</Text>
-              ) : (
-                adminToolChests.map((chest) => (
-                  <View key={chest.id} style={styles.adminToolsChest}>
-                    <View style={styles.adminToolsChestHeader}>
-                      <Text style={styles.adminToolsChestTitle}>
-                        {chest.rarity} / {chest.tier || 'weathered'}
-                      </Text>
-                      <Text style={styles.subtle}>
-                        Rewards {chest.rewardCount} (locked {chest.lockedCount})
-                      </Text>
-                    </View>
-                    <View style={styles.adminToolsChestActions}>
-                      <Pressable
-                        style={[
-                          styles.buttonSmall,
-                          styles.buttonGhost,
-                          adminToolBusy && styles.buttonDisabled,
-                          { marginRight: 8 },
-                        ]}
-                        onPress={() => handleOpenAdminChest(chest.id)}
-                        disabled={adminToolBusy}
-                      >
-                        <Text style={styles.buttonGhostText}>Open</Text>
-                      </Pressable>
-                      <Pressable
-                        style={[
-                          styles.buttonSmall,
-                          styles.buttonGhost,
-                          adminToolBusy && styles.buttonDisabled,
-                          { marginRight: 0 },
-                        ]}
-                        onPress={() => handleUnlockAdminChest(chest.id)}
-                        disabled={adminToolBusy}
-                      >
-                        <Text style={styles.buttonGhostText}>Unlock All</Text>
-                      </Pressable>
-                    </View>
-                    {chest.rewards &&
-                      chest.rewards.map((reward) => (
-                        <View key={reward.id} style={styles.adminToolsRewardRow}>
-                          <Text style={styles.adminToolsRewardText}>
-                            {reward.name} [{reward.type}] {reward.locked ? '(locked)' : '(unlocked)'}
-                          </Text>
-                        </View>
-                      ))}
-                  </View>
-                ))
-              )}
-              <Text style={styles.panelSubtitle}>Card Grants</Text>
-              <View style={styles.adminToolsRow}>
-                <TextInput
-                  style={styles.adminToolsInput}
-                  value={adminToolCardKey}
-                  onChangeText={setAdminToolCardKey}
-                  placeholder="Card key (e.g. return_signal)"
-                  autoCapitalize="none"
-                  editable={!adminToolBusy}
-                />
-              </View>
-              <View style={styles.adminToolsRow}>
-                <TextInput
-                  style={styles.adminToolsInput}
-                  value={adminToolCardQuantity}
-                  onChangeText={setAdminToolCardQuantity}
-                  keyboardType="number-pad"
-                  placeholder="Qty"
-                  editable={!adminToolBusy}
-                />
-              </View>
-              <Pressable
-                style={[styles.button, adminToolBusy && styles.buttonDisabled]}
-                onPress={handleGrantAdminCard}
-                disabled={adminToolBusy}
-              >
-                <Text style={styles.buttonText}>Grant Card</Text>
-              </Pressable>
-              {adminToolNotice ? (
-                <Text style={styles.adminToolsNotice}>{adminToolNotice}</Text>
-              ) : null}
-            </>
-          )}
         </View>
       ) : null}
 
       {showTasks ? (
         <View style={styles.panel}>
-          <View
-            style={styles.taskNav}
-            accessibilityRole="tablist"
-            accessibilityLabel="Task sections"
-          >
-            {TASK_SECTIONS.map((section) => {
-              const isActive = activeTaskSection === section.key;
-              return (
-                <Pressable
-                  key={section.key}
-                  style={[
-                    styles.taskButton,
-                    isActive && styles.taskButtonActive,
-                  ]}
-                  onPress={() => handleTaskSectionChange(section.key)}
-                  accessibilityRole="tab"
-                  accessibilityState={{ selected: isActive }}
-                >
-                  <Text
-                    style={[
-                      styles.taskButtonText,
-                      isActive && styles.taskButtonTextActive,
-                    ]}
-                  >
-                    {section.label}
-                  </Text>
-                </Pressable>
-              );
-            })}
+          <View style={styles.primaryActionCard}>
+            <Text style={styles.primaryActionLabel}>Primary Action</Text>
+            <Text style={styles.primaryActionTitle}>{primaryAction.title}</Text>
+            <Text style={styles.primaryActionHelper}>{primaryAction.helper}</Text>
+            <Pressable style={styles.primaryActionButton} onPress={primaryAction.onPress}>
+              <Text style={styles.primaryActionButtonText}>{primaryAction.cta}</Text>
+            </Pressable>
           </View>
+          {chestNotice?.chestId ? (
+            <View style={styles.noticeCard}>
+              <Text style={styles.noticeTitle}>Chest earned</Text>
+              <Text style={styles.noticeSubtle}>Your rewards are waiting.</Text>
+              <Pressable
+                style={styles.buttonSmall}
+                onPress={() => {
+                  setChestNotice(null);
+                  setActiveTab('Inventory');
+                }}
+              >
+                <Text style={styles.buttonText}>Open chest</Text>
+              </Pressable>
+            </View>
+          ) : null}
           <Text style={styles.panelTitle}>Status</Text>
           <View style={styles.heroRow}>
             <View style={styles.avatarBox}>
@@ -2571,13 +2807,42 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
               </View>
             </View>
           </View>
+          <View style={styles.expRow}>
+            <Text style={styles.expLabel}>Growth</Text>
+            <View style={styles.expTrack}>
+              <Animated.View
+                style={[
+                  styles.expFill,
+                  {
+                    width: expAnim.current.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: ['0%', '100%'],
+                    }),
+                  },
+                ]}
+              />
+            </View>
+            {phase2Active ? (
+              <Pressable
+                style={[styles.expToggle, expNotesEnabled && styles.expToggleActive]}
+                onPress={() => setExpNotesEnabled((prev) => !prev)}
+              >
+                <Text
+                  style={[styles.expToggleText, expNotesEnabled && styles.expToggleTextActive]}
+                >
+                  Growth notes: {expNotesEnabled ? 'On' : 'Off'}
+                </Text>
+              </Pressable>
+            ) : null}
+            {expNoteMessage ? <Text style={styles.expNote}>{expNoteMessage}</Text> : null}
+          </View>
           <View style={styles.divider} />
           <View style={styles.statRow}>
             <Text style={styles.statLabel}>Habits</Text>
             <Text style={styles.statValue}>{counts.habits}</Text>
           </View>
           <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Efforts Logged</Text>
+            <Text style={styles.statLabel}>Actions Logged</Text>
             <Text style={styles.statValue}>{counts.efforts}</Text>
           </View>
           <View style={styles.statRow}>
@@ -2633,7 +2898,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
             <Text style={styles.statValue}>{evidence.activeDays}</Text>
           </View>
           <View style={styles.statRow}>
-            <Text style={styles.statLabel}>Last Effort</Text>
+            <Text style={styles.statLabel}>Last Action</Text>
             <Text style={styles.statValue}>
               {evidence.lastEffortAt
                 ? new Date(evidence.lastEffortAt).toLocaleDateString()
@@ -2657,7 +2922,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
               <View style={styles.orientationPanel}>
                 <Text style={styles.panelTitle}>Take the First Step</Text>
                 <Text style={styles.orientationSubtitle}>Every system begins with a single signal.</Text>
-                <Text style={styles.orientationObjective}>Objective: Log any effort once.</Text>
+                <Text style={styles.orientationObjective}>Objective: Log any action once.</Text>
                 <Text style={styles.subtle}>
                   This is enough for now. Action first, explanation later.
                 </Text>
@@ -2689,83 +2954,30 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
                 <Text style={styles.orientationMessageText}>{orientationMessage}</Text>
               </View>
             ) : null}
-            <Text style={styles.panelTitle}>Arc Quests</Text>
-            {arcQuests.length === 0 ? (
+            <Text style={styles.panelTitle}>Current Arc Quest</Text>
+            {!currentArcQuest ? (
               <Text style={styles.subtle}>Arc quests appear quietly over time.</Text>
             ) : (
-              <View style={styles.arcList}>
-                {arcQuests.map((quest) => {
-                  const linkedHabit = habitById.get(quest.habitId);
-                  return (
-                    <View key={quest.id} style={styles.arcCard}>
-                      <View style={styles.arcHeader}>
-                        <Text style={styles.arcTitle}>{quest.title}</Text>
-                        <Text style={styles.arcTheme}>{quest.theme}</Text>
-                      </View>
-                      <Text style={styles.subtle}>{quest.summary}</Text>
-                      <View style={styles.arcProgressRow}>
-                        <Text style={styles.arcProgressValue}>{quest.progress} effort</Text>
-                        <Text style={styles.arcProgressMeta}>
-                          {quest.unlockedCount}/{quest.totalFragments} fragments
-                        </Text>
-                      </View>
-                      {quest.nextMilestone ? (
-                        <Text style={styles.arcProgressMeta}>
-                          Next fragment at {quest.nextMilestone} effort
-                        </Text>
-                      ) : (
-                        <Text style={styles.arcProgressMeta}>All fragments unlocked.</Text>
-                      )}
-                      <View style={styles.arcControlRow}>
-                        <Text style={styles.arcHint}>
-                          Arc quests describe your journey—they never demand a daily task.
-                        </Text>
-                        {!quest.accepted && (
-                          <View style={styles.arcButtonRow}>
-                            <Pressable
-                              style={[styles.buttonSmall, styles.arcAcceptButton]}
-                              onPress={() => handleAcceptArc(quest.id)}
-                            >
-                              <Text style={styles.buttonText}>Accept quest</Text>
-                            </Pressable>
-                            {!quest.ignored && (
-                              <Pressable
-                                style={styles.buttonGhost}
-                                onPress={() => handleIgnoreArc(quest.id)}
-                              >
-                                <Text style={styles.buttonGhostText}>Ignore for now</Text>
-                              </Pressable>
-                            )}
-                          </View>
-                        )}
-                        {quest.accepted && (
-                          <View style={styles.arcLinkRow}>
-                            <Text style={styles.subtle}>
-                              Linked Habit:&nbsp;
-                              <Text style={{ color: ACCENT_GOLD }}>
-                                {linkedHabit ? linkedHabit.name : 'None yet'}
-                              </Text>
-                            </Text>
-                            <Pressable
-                              style={[styles.buttonSmall, styles.arcLinkButton]}
-                              onPress={() => handleCycleArcHabit(quest)}
-                            >
-                              <Text style={styles.buttonText}>
-                                {linkedHabit ? 'Rebind habit' : 'Bind a habit'}
-                              </Text>
-                            </Pressable>
-                          </View>
-                        )}
-                        {!quest.accepted && quest.ignored ? (
-                          <Text style={styles.quietText}>
-                            Ignored quietly—accept any time to re-open this narrative.
-                          </Text>
-                        ) : null}
-                      </View>
-                    </View>
-                  );
-                })}
-              </View>
+              <>
+                <View style={styles.arcList}>{renderArcQuestCard(currentArcQuest)}</View>
+                {arcQuests.length > 1 ? (
+                  <Pressable
+                    style={styles.buttonGhost}
+                    onPress={() => setShowAllArcQuests((prev) => !prev)}
+                  >
+                    <Text style={styles.buttonGhostText}>
+                      {showAllArcQuests ? 'Hide quests' : 'View all quests'}
+                    </Text>
+                  </Pressable>
+                ) : null}
+                {showAllArcQuests ? (
+                  <View style={styles.arcList}>
+                    {arcQuests
+                      .filter((quest) => quest.id !== currentArcQuest.id)
+                      .map((quest) => renderArcQuestCard(quest))}
+                  </View>
+                ) : null}
+              </>
             )}
           </View>
       ) : null}
@@ -2774,7 +2986,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
         <View style={styles.panelQuiet}>
           <Text style={styles.panelTitle}>Re-entry</Text>
           <Text style={styles.quietText}>
-            No backlog. Start small and log a single effort when ready.
+            No backlog. Start small and log a single action when ready.
           </Text>
         </View>
       ) : null}
@@ -2804,14 +3016,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
                   ? `Mode: Linked (${authEmail || 'signed in'})`
                   : 'Mode: Guest (local-first)'}
               </Text>
-              {adminStatus === 'signed_in' ? (
-                <Text style={styles.subtle}>Admin access enabled.</Text>
-              ) : null}
-              {authStatus === 'signed_in' ? (
-                <Text style={styles.subtle}>
-                  Admin claim: {adminClaim === null ? 'Not present' : adminClaim ? 'true' : 'false'}
-                </Text>
-              ) : null}
+              
             </View>
           ) : null}
 
@@ -2885,7 +3090,9 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
                   <Text style={styles.subtle}>Level {backupPreview.identityLevel}</Text>
                   <Text style={styles.subtle}>Effort {backupPreview.totalEffort}</Text>
                   <Text style={styles.subtle}>Habits {backupPreview.habits}</Text>
-                  <Text style={styles.subtle}>Cards {backupPreview.cards || 0}</Text>
+                  {phase2Active ? (
+                    <Text style={styles.subtle}>Cards {backupPreview.cards || 0}</Text>
+                  ) : null}
                   <Text style={styles.subtle}>Chests {backupPreview.chests}</Text>
                   <Text style={styles.subtle}>Items {backupPreview.items}</Text>
                   <Pressable
@@ -2950,407 +3157,10 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
           {accountMessage ? <Text style={styles.subtle}>{accountMessage}</Text> : null}
         </View>
       ) : null}
-{showAdmin ? (
-        <View style={styles.panel}>
-          <Text style={styles.panelTitle}>Admin Dashboard</Text>
-          <Text style={styles.subtle}>
-            Server must enforce RLS. Client checks alone are not sufficient.
-          </Text>
-          <Text style={styles.subtle}>
-            Admin email list only gates UI visibility, not data access.
-          </Text>
-          {adminStatus === 'disabled' ? (
-            <Text style={styles.subtle}>Admin tools are disabled.</Text>
-          ) : null}
-          {adminStatus === 'signed_out' ? (
-            <Text style={styles.subtle}>Sign in via Help > Link account to access admin tools.</Text>
-          ) : null}
-          {adminStatus === 'signed_in' ? (
-            <>
-              <View style={styles.adminTabRow}>
-                {ADMIN_TABS.map((tab) => (
-                  <Pressable
-                    key={tab}
-                    style={[styles.adminTab, adminTab === tab && styles.adminTabActive]}
-                    onPress={() => setAdminTab(tab)}
-                  >
-                    <Text style={[styles.adminTabText, adminTab === tab && styles.adminTabTextActive]}>
-                      {tab}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
+          
+          
 
-              {adminTab === 'Overview' ? (
-                <View style={styles.adminGrid}>
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>Users</Text>
-                    <View style={styles.habitInputRow}>
-                      <TextInput
-                        value={adminUserSearch}
-                        onChangeText={setAdminUserSearch}
-                        placeholder="Search email"
-                        placeholderTextColor="#4b5563"
-                        style={styles.input}
-                        autoCapitalize="none"
-                      />
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={handleRefreshAdminOverview}
-                        disabled={adminLoading}
-                      >
-                        <Text style={styles.buttonText}>Load</Text>
-                      </Pressable>
-                    </View>
-                    <View style={styles.habitInputRow}>
-                      <TextInput
-                        value={adminUserIdSearch}
-                        onChangeText={setAdminUserIdSearch}
-                        placeholder="User id"
-                        placeholderTextColor="#4b5563"
-                        style={styles.input}
-                        autoCapitalize="none"
-                      />
-                    </View>
-                    <View style={styles.habitInputRow}>
-                      <TextInput
-                        value={adminDateFrom}
-                        onChangeText={setAdminDateFrom}
-                        placeholder="From (YYYY-MM-DD)"
-                        placeholderTextColor="#4b5563"
-                        style={styles.input}
-                        autoCapitalize="none"
-                      />
-                      <TextInput
-                        value={adminDateTo}
-                        onChangeText={setAdminDateTo}
-                        placeholder="To (YYYY-MM-DD)"
-                        placeholderTextColor="#4b5563"
-                        style={styles.input}
-                        autoCapitalize="none"
-                      />
-                    </View>
-                    {adminUsers.length === 0 ? (
-                      <Text style={styles.subtle}>No users loaded.</Text>
-                    ) : (
-                      adminUsers.map((user) => {
-                        const summary = adminSummaries.find(
-                          (item) => item.user_id === user.user_id
-                        );
-                        return (
-                          <View key={user.user_id} style={styles.adminRow}>
-                            <Text style={styles.adminRowTitle}>{user.email || user.user_id}</Text>
-                            <Text style={styles.subtle}>
-                              Last seen: {user.last_seen_at ? new Date(user.last_seen_at).toLocaleString() : '-'}
-                            </Text>
-                            {summary ? (
-                              <Text style={styles.subtle}>
-                                Effort {summary.total_effort || 0} - Habits {summary.habits || 0} -
-                                Chests {summary.chests || 0}
-                              </Text>
-                            ) : (
-                              <Text style={styles.subtle}>No summary yet.</Text>
-                            )}
-                          </View>
-                        );
-                      })
-                    )}
-                    <View style={styles.habitInputRow}>
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={() => {
-                          setAdminUserPage((prev) => Math.max(0, prev - 1));
-                          handleRefreshAdminOverview();
-                        }}
-                        disabled={adminLoading || adminUserPage === 0}
-                      >
-                        <Text style={styles.buttonText}>Prev</Text>
-                      </Pressable>
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={() => {
-                          setAdminUserPage((prev) => prev + 1);
-                          handleRefreshAdminOverview();
-                        }}
-                        disabled={adminLoading}
-                      >
-                        <Text style={styles.buttonText}>Next</Text>
-                      </Pressable>
-                    </View>
-                  </View>
-
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>System Health</Text>
-                    {adminEvents.length === 0 ? (
-                      <Text style={styles.subtle}>No events.</Text>
-                    ) : (
-                      adminEvents.map((event) => (
-                        <Text key={event.id} style={styles.subtle}>
-                          {new Date(event.created_at).toLocaleString()} - {event.type}
-                          {event.message ? ` - ${event.message}` : ''}
-                        </Text>
-                      ))
-                    )}
-                    <View style={styles.habitInputRow}>
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={() => {
-                          setAdminEventsPage((prev) => Math.max(0, prev - 1));
-                          handleRefreshAdminOverview();
-                        }}
-                        disabled={adminLoading || adminEventsPage === 0}
-                      >
-                        <Text style={styles.buttonText}>Prev</Text>
-                      </Pressable>
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={() => {
-                          setAdminEventsPage((prev) => prev + 1);
-                          handleRefreshAdminOverview();
-                        }}
-                        disabled={adminLoading}
-                      >
-                        <Text style={styles.buttonText}>Next</Text>
-                      </Pressable>
-                    </View>
-                  </View>
-
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>Admin Audit</Text>
-                    {adminAudit.length === 0 ? (
-                      <Text style={styles.subtle}>No admin actions logged.</Text>
-                    ) : (
-                      adminAudit.map((entry) => (
-                        <Text key={entry.id} style={styles.subtle}>
-                          {new Date(entry.created_at).toLocaleString()} - {entry.action}
-                          {entry.target_user_id ? ` - ${entry.target_user_id}` : ''}
-                        </Text>
-                      ))
-                    )}
-                    <View style={styles.habitInputRow}>
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={() => {
-                          setAdminAuditPage((prev) => Math.max(0, prev - 1));
-                          handleRefreshAdminOverview();
-                        }}
-                        disabled={adminLoading || adminAuditPage === 0}
-                      >
-                        <Text style={styles.buttonText}>Prev</Text>
-                      </Pressable>
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={() => {
-                          setAdminAuditPage((prev) => prev + 1);
-                          handleRefreshAdminOverview();
-                        }}
-                        disabled={adminLoading}
-                      >
-                        <Text style={styles.buttonText}>Next</Text>
-                      </Pressable>
-                    </View>
-                  </View>
-                </View>
-              ) : null}
-
-              {adminTab === 'Backups' ? (
-                <View style={styles.adminGrid}>
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>Backups</Text>
-                    <Pressable
-                      style={styles.buttonGhost}
-                      onPress={handleVerifyRls}
-                      disabled={adminLoading}
-                    >
-                      <Text style={styles.buttonGhostText}>Verify RLS</Text>
-                    </Pressable>
-                    {rlsMessage ? <Text style={styles.subtle}>{rlsMessage}</Text> : null}
-                    <View style={styles.habitInputRow}>
-                      <TextInput
-                        value={adminFilter}
-                        onChangeText={setAdminFilter}
-                        placeholder="Filter by user id"
-                        placeholderTextColor="#4b5563"
-                        style={styles.input}
-                        autoCapitalize="none"
-                      />
-                      <Pressable
-                        style={styles.buttonSmall}
-                        onPress={handleRefreshBackups}
-                        disabled={adminLoading}
-                      >
-                        <Text style={styles.buttonText}>Refresh</Text>
-                      </Pressable>
-                    </View>
-                    {adminBackups.length === 0 ? (
-                      <Text style={styles.subtle}>No backups loaded yet.</Text>
-                    ) : (
-                      adminBackups.map((backup) => (
-                        <Pressable
-                          key={backup.user_id}
-                          style={[
-                            styles.adminRow,
-                            adminSelectedUserId === backup.user_id && styles.adminRowSelected,
-                          ]}
-                          onPress={() => {
-                            setAdminSelectedUserId(backup.user_id);
-                            setAdminSummary(null);
-                            setAdminHistory([]);
-                          }}
-                        >
-                          <View>
-                            <Text style={styles.adminRowTitle}>{backup.user_id}</Text>
-                            <Text style={styles.subtle}>
-                              Updated {new Date(backup.updated_at).toLocaleString()}
-                            </Text>
-                          </View>
-                        </Pressable>
-                      ))
-                    )}
-                  </View>
-
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>Selected User</Text>
-                    {adminSelectedUserId ? (
-                      <>
-                        <Text style={styles.subtle}>{adminSelectedUserId}</Text>
-                        <Pressable
-                          style={styles.button}
-                          onPress={handlePreviewBackup}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonText}>Preview summary</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={handleLoadBackupHistoryForUser}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Load history</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={() => handleDeleteUserData('backup')}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Delete latest backup</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={() => handleDeleteUserData('history')}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Delete backup history</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={() => handleDeleteUserData('summary')}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Delete summary</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={() => handleDeleteUserData('events')}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Delete system events</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={() => handleDeleteUserData('profile')}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Delete profile</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={handleDeleteAllUserData}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Delete ALL user data</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={handleExportBackup}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Export JSON</Text>
-                        </Pressable>
-                        <Pressable
-                          style={styles.buttonGhost}
-                          onPress={handleLoadBackupForUser}
-                          disabled={adminLoading}
-                        >
-                          <Text style={styles.buttonGhostText}>Load to this device</Text>
-                        </Pressable>
-                      </>
-                    ) : (
-                      <Text style={styles.subtle}>Select a user to manage.</Text>
-                    )}
-                  </View>
-
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>History</Text>
-                    {adminHistory.length > 0 ? (
-                      adminHistory.map((entry) => (
-                        <View key={entry.id || entry.updatedAt} style={styles.menuSection}>
-                          <Text style={styles.subtle}>
-                            {new Date(entry.updatedAt).toLocaleString()}
-                            {entry.deviceId ? ` - ${entry.deviceId}` : ''}
-                            {entry.appVersion ? ` (v${entry.appVersion})` : ''}
-                          </Text>
-                          <View style={styles.habitInputRow}>
-                            <Pressable
-                              style={styles.buttonSmall}
-                              onPress={() => handleRestoreHistoryEntry(entry)}
-                              disabled={adminLoading}
-                            >
-                              <Text style={styles.buttonText}>Restore</Text>
-                            </Pressable>
-                            <Pressable
-                              style={styles.buttonSmall}
-                              onPress={() => handleExportHistoryEntry(entry)}
-                              disabled={adminLoading}
-                            >
-                              <Text style={styles.buttonText}>Export</Text>
-                            </Pressable>
-                          </View>
-                        </View>
-                      ))
-                    ) : (
-                      <Text style={styles.subtle}>No history loaded.</Text>
-                    )}
-                  </View>
-                </View>
-              ) : null}
-
-              {adminTab === 'Logs' ? (
-                <View style={styles.adminGrid}>
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>Recent Actions</Text>
-                    {adminLog.length > 0 ? (
-                      adminLog.map((entry, index) => (
-                        <Text key={`${entry.at}-${index}`} style={styles.subtle}>
-                          {new Date(entry.at).toLocaleString()} - {entry.label}
-                        </Text>
-                      ))
-                    ) : (
-                      <Text style={styles.subtle}>No recent actions.</Text>
-                    )}
-                  </View>
-                  <View style={styles.adminCard}>
-                    <Text style={styles.adminCardTitle}>Admin Message</Text>
-                    <Text style={styles.subtle}>{adminMessage || 'No messages.'}</Text>
-                  </View>
-                </View>
-              ) : null}
-            </>
-          ) : null}
-          {adminMessage ? <Text style={styles.subtle}>{adminMessage}</Text> : null}
-        </View>
-      ) : null}
-      {showTasks ? (
+              {showTasks ? (
         <View style={[styles.panel, styles.panelTight]}>
           <Text style={styles.panelTitle}>Habits</Text>
           {habits.length === 0 ? (
@@ -3358,103 +3168,34 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
           ) : (
             habits.map((habit) => {
               const actionConfig = getHabitActionConfig(habit);
-              const habitTypeLabel =
-                actionConfig.type === 'gym'
-                  ? 'Gym Habit'
-                  : actionConfig.type === 'water'
-                  ? 'Hydration Habit'
-                  : 'Habit Effort';
-              const waterCount = habitActionCounts[habit.id] ?? 0;
               return (
-                <View key={habit.id} style={styles.habitBlock}>
-                  <View style={styles.habitRow}>
-                    <Pressable
-                      style={[
-                        styles.habitChip,
-                        habitId === habit.id && styles.habitChipSelected,
-                        !habit.isActive && styles.habitChipDisabled,
-                      ]}
-                      onPress={() => setHabitId(habit.id)}
-                    >
-                      <View style={styles.habitLabelRow}>
-                        <Text style={styles.habitText}>{habit.name}</Text>
-                        <Text style={styles.habitEffort}>
-                          {habitEfforts[habit.id]
-                            ? `${habitEfforts[habit.id].effort}/10 (${Math.round(
-                                habitEfforts[habit.id].prevalence
-                              )}% of US adults do this)`
-                            : ''}
-                        </Text>
-                      </View>
-                    </Pressable>
-                    <View style={styles.habitActions}>
-                      <Pressable style={styles.habitToggle} onPress={() => handleToggleHabit(habit)}>
-                        <Text style={styles.habitToggleText}>{habit.isActive ? 'Active' : 'Paused'}</Text>
-                      </Pressable>
-                      <Pressable style={styles.habitDelete} onPress={() => handleDeleteHabit(habit)}>
-                        <Text style={styles.habitDeleteText}>Delete</Text>
-                      </Pressable>
-                    </View>
-                  </View>
-                  <View style={styles.habitActionRow}>
-                    <View style={styles.habitActionDetails}>
-                      <Text style={styles.habitActionLabel}>{habitTypeLabel}</Text>
-                      <Text style={styles.habitActionSummary}>{actionConfig.summary}</Text>
-                      {actionConfig.type === 'water' ? (
-                        <Text style={styles.habitActionCounter}>
-                          {waterCount} cup{waterCount === 1 ? '' : 's'} logged today
-                        </Text>
-                      ) : null}
-                    </View>
-                    <Pressable
-                      style={[
-                        styles.habitActionButton,
-                        !habit.isActive && styles.buttonDisabled,
-                      ]}
-                      onPress={() => handleHabitAction(habit)}
-                      disabled={!habit.isActive}
-                    >
-                      <Text style={styles.habitActionButtonText}>{actionConfig.label}</Text>
-                    </Pressable>
-                  </View>
+                <View key={habit.id} style={styles.habitListRow}>
+                  <Pressable
+                    style={[
+                      styles.habitCard,
+                      !habit.isActive && styles.habitCardPaused,
+                    ]}
+                    onPress={() => setHabitDetailId(habit.id)}
+                  >
+                    <Text style={styles.habitCardTitle}>{habit.name}</Text>
+                    <Text style={styles.habitCardMeta}>
+                      {habit.isActive ? 'Active' : 'Paused'}
+                    </Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.habitQuickButton, !habit.isActive && styles.buttonDisabled]}
+                    onPress={() => handleHabitAction(habit)}
+                    disabled={!habit.isActive}
+                  >
+                    <Text style={styles.habitQuickButtonText}>{actionConfig.label}</Text>
+                  </Pressable>
                 </View>
               );
             })
           )}
-          <View style={styles.menuDivider} />
-          <Text style={styles.panelTitle}>Log Effort</Text>
-          {selectedHabit ? (
-            <>
-              <Text style={styles.subtle}>
-                Selected: {selectedHabit.name} {selectedHabit.isActive ? '' : '(paused)'}
-              </Text>
-              <Text style={styles.subtle}>
-                Effort auto-calculated from US prevalence:
-                {effortInfo ? ` ${effortInfo.effort}/10` : ' ...'}
-              </Text>
-              <Text style={styles.subtle}>
-                This value is fixed by habit prevalence to keep effort consistent.
-              </Text>
-              <TextInput
-                value={effortNote}
-                onChangeText={setEffortNote}
-                placeholder="Optional note..."
-                placeholderTextColor="#4b5563"
-                style={[styles.input, styles.noteInput]}
-              />
-              <Pressable
-                style={[styles.button, !selectedHabit.isActive && styles.buttonDisabled]}
-                onPress={() => handleLogEffort({ habitId: selectedHabit.id })}
-                disabled={!selectedHabit.isActive}
-              >
-                <Text style={styles.buttonText}>Log effort</Text>
-              </Pressable>
-            </>
-          ) : (
-            <Text style={styles.subtle}>Select a habit to log effort.</Text>
-          )}
           <View style={styles.habitInputRow}>
             <TextInput
+              ref={newHabitInputRef}
               value={newHabitName}
               onChangeText={setNewHabitName}
               placeholder="New habit name"
@@ -3472,7 +3213,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
         <View style={styles.panel}>
           <Text style={styles.panelTitle}>Chests</Text>
           {chests.length === 0 ? (
-            <Text style={styles.subtle}>No chests yet. Log effort to earn one.</Text>
+          <Text style={styles.subtle}>No chests yet. Log an action to earn one.</Text>
           ) : (
             <View style={styles.grid}>
               {chests.map((chest) => (
@@ -3496,7 +3237,70 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
         </View>
       ) : null}
 
-      {showChallenges ? (
+      {showGallery && phase2Active ? (
+        <View style={styles.panel}>
+          <Text style={styles.panelTitle}>Seasonal Gallery</Text>
+          {SEASON_MANIFEST.map((season) => (
+            <View key={season.id} style={styles.gallerySeason}>
+              <View style={styles.galleryHeader}>
+                <Text style={styles.galleryTitle}>{season.name}</Text>
+                <Text style={styles.galleryTime}>{season.timeframe}</Text>
+              </View>
+              {season.theme ? (
+                <Text style={styles.galleryTheme}>{season.theme}</Text>
+              ) : null}
+              {adminSeasonLocks[season.id] ? (
+                <View style={styles.galleryLocked}>
+                  <Text style={styles.galleryLockedText}>Season locked</Text>
+                </View>
+              ) : (
+              <View style={styles.grid}>
+                {season.cards.map((card, index) => {
+                  const discoveredCount = galleryCardStats.counts.get(card.key) || 0;
+                  const adminRevealed = !!adminRevealedCards[card.key];
+                  const discovered = discoveredCount > 0 || adminRevealed;
+                  const latest = galleryCardStats.latest.get(card.key);
+                  const rarity = card.rarity || latest?.rarity || 'common';
+                  const frameColor = getRarityColor(rarity);
+                  return (
+                    <Pressable
+                      key={`${season.id}-${card.key}`}
+                      style={[
+                        styles.galleryCard,
+                        !discovered && styles.galleryCardUnknown,
+                        { borderColor: frameColor },
+                      ]}
+                      onPress={() =>
+                        setGallerySelection({
+                          season,
+                          card,
+                          discovered,
+                          discoveredCount: discoveredCount > 0 ? discoveredCount : 1,
+                          latest,
+                        })
+                      }
+                    >
+                      <Text style={styles.gallerySlotIndex}>Slot {index + 1}</Text>
+                      <Text style={styles.galleryCardTitle}>
+                        {discovered ? card.name : '?'}
+                      </Text>
+                      <Text style={styles.galleryCardRarity}>{rarity.toUpperCase()}</Text>
+                      {discovered ? (
+                        <Text style={styles.galleryCardCount}>
+                          x{discoveredCount > 0 ? discoveredCount : 1}
+                        </Text>
+                      ) : null}
+                    </Pressable>
+                  );
+                })}
+              </View>
+              )}
+            </View>
+          ))}
+        </View>
+      ) : null}
+
+      {showQuests ? (
         <View style={styles.panel}>
           <Text style={styles.panelTitle}>Habit Journeys</Text>
           {habits.length === 0 ? (
@@ -3577,7 +3381,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
                       disabled={!challengeHabit.isActive}
                     >
                       <Text style={styles.challengeLogButtonText}>
-                        {challengeActionConfig?.label || 'Log effort'}
+                        {challengeActionConfig?.label || 'Log action'}
                       </Text>
                     </Pressable>
                     <Pressable
@@ -3618,14 +3422,15 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
             ))}
           </View>
           {efforts.length === 0 ? (
-            <Text style={styles.subtle}>No effort logged yet.</Text>
+            <Text style={styles.subtle}>No actions logged yet.</Text>
           ) : (
             efforts.map((effort) => (
               <View key={effort.id} style={styles.effortRowCompact}>
                 <View>
                   <Text style={styles.effortTitle}>{effort.habitName}</Text>
                   <Text style={styles.effortMeta}>
-                    {new Date(effort.timestamp).toLocaleDateString()} - {effort.effortValue} units
+                    {new Date(effort.timestamp).toLocaleDateString()} -{' '}
+                    {typeof effort.units === 'number' ? effort.units : 1} units
                   </Text>
                   {effort.note ? <Text style={styles.effortNote}>Note: {effort.note}</Text> : null}
                 </View>
@@ -3665,7 +3470,7 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
           <View style={styles.menuDivider} />
           <View style={styles.menuSection}>
             <Text style={styles.menuLabel}>Inventory</Text>
-            {unlockedItems.length === 0 && unlockedCards.length === 0 ? (
+            {unlockedItems.length === 0 && !hasVisibleCards ? (
               <Text style={styles.subtle}>Rewards remain locked until combat unlocks them.</Text>
             ) : (
               <>
@@ -3692,11 +3497,11 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
                     </View>
                   </>
                 ) : null}
-                {unlockedCards.length > 0 ? (
+                {hasVisibleCards ? (
                   <>
                     <Text style={styles.menuHint}>Cards</Text>
                     <View style={styles.grid}>
-                      {unlockedCards.map((card) => (
+                      {visibleCards.map((card) => (
                         <View key={card.id} style={styles.gridCard}>
                           <Text style={styles.gridTitle}>{card.name}</Text>
                           <Text style={styles.gridSubtle}>{card.rarity}</Text>
@@ -3732,11 +3537,13 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     <View style={styles.appFrame}>
       <View style={styles.backgroundNebula} pointerEvents="none" />
       <View style={styles.backgroundRing} pointerEvents="none" />
-      <Image
-        source={require('../../assets/lifemaxxing-logo.png')}
-        style={styles.backgroundLogo}
-        accessibilityIgnoresInvertColors
-      />
+      <Pressable style={styles.backgroundLogoTap} onPress={handleLogoTap}>
+        <Image
+          source={require('../../assets/lifemaxxing-logo.png')}
+          style={styles.backgroundLogo}
+          accessibilityIgnoresInvertColors
+        />
+      </Pressable>
       {arcOverlay ? (
         <View style={styles.arcOverlay}>
           <View style={styles.arcOverlayCard}>
@@ -3750,6 +3557,204 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
             </Pressable>
           </View>
         </View>
+      ) : null}
+      {gallerySelection ? (
+        <View style={styles.galleryOverlay}>
+          <View style={styles.galleryModal}>
+            <Text style={styles.galleryModalTitle}>
+              {gallerySelection.discovered ? gallerySelection.card.name : 'Undiscovered'}
+            </Text>
+            <Text style={styles.galleryModalMeta}>
+              {gallerySelection.season.name} â€” {gallerySelection.season.timeframe}
+            </Text>
+            <View
+              style={[
+                styles.galleryModalBadge,
+                { borderColor: getRarityColor(gallerySelection.card.rarity) },
+              ]}
+            >
+              <Text style={styles.galleryModalBadgeText}>
+                {gallerySelection.card.rarity.toUpperCase()}
+              </Text>
+            </View>
+            {gallerySelection.discovered ? (
+              <>
+                <Text style={styles.galleryModalBody}>
+                  {gallerySelection.latest?.effect || 'A quiet artifact from your journey.'}
+                </Text>
+                <Text style={styles.galleryModalCount}>
+                  Owned: x{gallerySelection.discoveredCount}
+                </Text>
+              </>
+            ) : (
+              <Text style={styles.galleryModalBody}>
+                This card will reveal itself when it is discovered.
+              </Text>
+            )}
+            <Pressable style={styles.button} onPress={() => setGallerySelection(null)}>
+              <Text style={styles.buttonText}>Close</Text>
+            </Pressable>
+          </View>
+        </View>
+      ) : null}
+      {habitDetail ? (
+        <View style={styles.habitDetailOverlay}>
+          <View style={styles.habitDetailCard}>
+            <Text style={styles.habitDetailTitle}>{habitDetail.name}</Text>
+            <Text style={styles.habitDetailMeta}>
+              {habitDetail.isActive ? 'Active' : 'Paused'} Â·{' '}
+              {getHabitActionConfig(habitDetail).summary}
+            </Text>
+            {getHabitActionConfig(habitDetail).type === 'water' ? (
+              <Text style={styles.habitDetailMeta}>
+                {habitActionCounts[habitDetail.id] ?? 0} cup
+                {(habitActionCounts[habitDetail.id] ?? 0) === 1 ? '' : 's'} today
+              </Text>
+            ) : null}
+            <View style={styles.habitDetailActions}>
+              <Pressable
+                style={[
+                  styles.habitDetailPrimaryButton,
+                  !habitDetail.isActive && styles.buttonDisabled,
+                ]}
+                onPress={() =>
+                  handleLogEffort({
+                    habitId: habitDetail.id,
+                    note: habitLogNote,
+                  })
+                }
+                disabled={!habitDetail.isActive}
+              >
+                <Text style={styles.habitDetailPrimaryText}>
+                  {getHabitActionConfig(habitDetail).label}
+                </Text>
+              </Pressable>
+              <Pressable
+                style={styles.habitDetailSecondaryButton}
+                onPress={() => handleToggleHabit(habitDetail)}
+              >
+                <Text style={styles.habitDetailSecondaryText}>
+                  {habitDetail.isActive ? 'Pause' : 'Resume'}
+                </Text>
+              </Pressable>
+              <Pressable
+                style={styles.habitDetailDeleteButton}
+                onPress={() => handleDeleteHabit(habitDetail)}
+              >
+                <Text style={styles.habitDetailDeleteText}>Delete</Text>
+              </Pressable>
+            </View>
+            <Text style={styles.habitDetailSectionLabel}>Quick Log Note (optional)</Text>
+            <TextInput
+              value={habitLogNote}
+              onChangeText={setHabitLogNote}
+              placeholder="Add a short note for this log..."
+              placeholderTextColor="#4b5563"
+              style={styles.habitDetailInput}
+            />
+            <Text style={styles.habitDetailSectionLabel}>Habit Notes</Text>
+            <TextInput
+              value={habitDetailNote}
+              onChangeText={(value) =>
+                setHabitNotes((prev) => ({ ...prev, [habitDetail.id]: value }))
+              }
+              placeholder="Optional notes about this habit..."
+              placeholderTextColor="#4b5563"
+              style={styles.habitDetailInput}
+              multiline
+            />
+            <Text style={styles.habitDetailSectionLabel}>Rest Days</Text>
+            <Text style={styles.habitDetailMeta}>Not configured.</Text>
+            <Text style={styles.habitDetailSectionLabel}>Recent Logs</Text>
+            {habitDetailLogs.length === 0 ? (
+              <Text style={styles.habitDetailMeta}>No actions logged yet.</Text>
+            ) : (
+              habitDetailLogs.map((log) => (
+                <Text key={log.id} style={styles.habitDetailLog}>
+                  {new Date(log.timestamp).toLocaleDateString()} Â·{' '}
+                  {log.actionType?.replace('_', ' ') || 'action'} Â·{' '}
+                  {typeof log.units === 'number' ? log.units : 1} unit
+                  {typeof log.units === 'number' && log.units === 1 ? '' : 's'}
+                </Text>
+              ))
+            )}
+            <Pressable
+              style={styles.buttonGhost}
+              onPress={() => {
+                setHabitDetailId(null);
+                setHabitLogNote('');
+              }}
+            >
+              <Text style={styles.buttonGhostText}>Close</Text>
+            </Pressable>
+          </View>
+        </View>
+      ) : null}
+      {adminAvailable && adminPaletteOpen ? (
+        <Pressable style={styles.adminPaletteOverlay} onPress={() => setAdminPaletteOpen(false)}>
+          <Pressable style={styles.adminPaletteCard} onPress={() => {}}>
+            <View style={styles.adminPaletteHeader}>
+              <Text style={styles.adminPaletteTitle}>Admin Command Palette</Text>
+              <Pressable onPress={() => setAdminPaletteOpen(false)}>
+                <Text style={styles.adminPaletteClose}>Close</Text>
+              </Pressable>
+            </View>
+            <TextInput
+              value={adminPaletteQuery}
+              onChangeText={setAdminPaletteQuery}
+              placeholder="Search commands..."
+              placeholderTextColor="#4b5563"
+              style={styles.adminPaletteInput}
+            />
+            <ScrollView style={styles.adminPaletteList}>
+              {filteredAdminCommands.map((command) => {
+                const selected = adminPaletteSelection?.id === command.id;
+                return (
+                  <Pressable
+                    key={command.id}
+                    style={[
+                      styles.adminPaletteItem,
+                      selected && styles.adminPaletteItemActive,
+                    ]}
+                    onPress={() => {
+                      setAdminPaletteSelection(command);
+                      setAdminPaletteParams({});
+                      setAdminPaletteMessage('');
+                    }}
+                  >
+                    <Text style={styles.adminPaletteItemText}>{command.label}</Text>
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+            {adminPaletteSelection ? (
+              <View style={styles.adminPaletteParams}>
+                {(adminPaletteSelection.params || []).map((param) => (
+                  <TextInput
+                    key={param.key}
+                    value={adminPaletteParams[param.key] || ''}
+                    onChangeText={(value) =>
+                      setAdminPaletteParams((prev) => ({ ...prev, [param.key]: value }))
+                    }
+                    placeholder={`${param.label}${param.placeholder ? ` (${param.placeholder})` : ''}`}
+                    placeholderTextColor="#4b5563"
+                    style={styles.adminPaletteInput}
+                  />
+                ))}
+                <Pressable
+                  style={[styles.button, adminPaletteBusy && styles.buttonDisabled]}
+                  onPress={() => handleRunAdminCommand(adminPaletteSelection)}
+                  disabled={adminPaletteBusy}
+                >
+                  <Text style={styles.buttonText}>Run</Text>
+                </Pressable>
+              </View>
+            ) : null}
+            {adminPaletteMessage ? (
+              <Text style={styles.adminPaletteMessage}>{adminPaletteMessage}</Text>
+            ) : null}
+          </Pressable>
+        </Pressable>
       ) : null}
       {showOnboarding ? (
         <View style={styles.onboardingOverlay}>
@@ -4000,20 +4005,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
         <View style={styles.centerRuneRing} pointerEvents="none" />
         <View style={styles.centerHeader}>
           <Text style={styles.centerTitle}>{activeTab.toUpperCase()}</Text>
-            <View style={styles.centerTabs}>
-              <View style={styles.centerTabActive}>
-                <Text style={styles.centerTabText}>STATUS</Text>
-              </View>
-              <View style={styles.centerTab}>
-                <Text style={styles.centerTabText}>QUESTS</Text>
-              </View>
-              <View style={styles.centerTab}>
-                <Text style={styles.centerTabText}>SKILLS</Text>
-              </View>
-              <View style={styles.centerTab}>
-                <Text style={styles.centerTabText}>EQUIP</Text>
-              </View>
-            </View>
           </View>
 
           <ScrollView style={styles.centerScroll} contentContainerStyle={styles.centerScrollContent}>
@@ -4068,6 +4059,13 @@ const styles = StyleSheet.create({
     height: 240,
     opacity: 0.08,
     resizeMode: 'contain',
+  },
+  backgroundLogoTap: {
+    position: 'absolute',
+    right: -40,
+    bottom: -30,
+    width: 240,
+    height: 240,
   },
   topBar: {
     height: TOP_BAR_HEIGHT,
@@ -4124,34 +4122,6 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   navTextActive: {
-    color: '#ffffff',
-    fontWeight: '700',
-  },
-  taskNav: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 10,
-    marginBottom: 12,
-  },
-  taskButton: {
-    borderWidth: 1,
-    borderColor: '#2b4e82',
-    borderRadius: 12,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    backgroundColor: '#0f1a35',
-  },
-  taskButtonActive: {
-    borderColor: '#7bc7ff',
-    backgroundColor: '#12315a',
-  },
-  taskButtonText: {
-    color: '#c7e2ff',
-    fontSize: FONT.sm,
-    letterSpacing: 1.2,
-    textTransform: 'uppercase',
-  },
-  taskButtonTextActive: {
     color: '#ffffff',
     fontWeight: '700',
   },
@@ -4499,6 +4469,228 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     zIndex: 50,
   },
+  galleryOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(4, 8, 18, 0.82)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 55,
+    padding: 24,
+  },
+  galleryModal: {
+    width: '100%',
+    maxWidth: 360,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#6fd0ff',
+    backgroundColor: '#0c1732',
+    padding: 20,
+    gap: 10,
+  },
+  galleryModalTitle: {
+    color: '#eaf4ff',
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  galleryModalMeta: {
+    color: '#9bb3d6',
+    fontSize: 12,
+  },
+  galleryModalBadge: {
+    alignSelf: 'flex-start',
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  galleryModalBadgeText: {
+    color: '#eaf4ff',
+    fontSize: 10,
+    letterSpacing: 0.6,
+  },
+  galleryModalBody: {
+    color: '#c7e2ff',
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  galleryModalCount: {
+    color: '#f6c46a',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  habitDetailOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(4, 8, 18, 0.82)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 60,
+    padding: 24,
+  },
+  habitDetailCard: {
+    width: '100%',
+    maxWidth: 420,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#7bc7ff',
+    backgroundColor: '#0c1732',
+    padding: 20,
+    gap: 10,
+  },
+  habitDetailTitle: {
+    color: '#eaf4ff',
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  habitDetailMeta: {
+    color: '#9bb3d6',
+    fontSize: 12,
+  },
+  habitDetailActions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  habitDetailPrimaryButton: {
+    flexGrow: 1,
+    borderRadius: 10,
+    paddingVertical: 10,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#79d2ff',
+    backgroundColor: '#1e63b8',
+  },
+  habitDetailPrimaryText: {
+    color: '#eaf4ff',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  habitDetailSecondaryButton: {
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    backgroundColor: '#0a152c',
+  },
+  habitDetailSecondaryText: {
+    color: '#c7e2ff',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  habitDetailDeleteButton: {
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#7a2c3b',
+    backgroundColor: '#1a0f1f',
+  },
+  habitDetailDeleteText: {
+    color: '#f2b8c6',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  habitDetailSectionLabel: {
+    color: '#9fe1ff',
+    fontSize: 11,
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+    marginTop: 6,
+  },
+  habitDetailInput: {
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: '#eaf4ff',
+    backgroundColor: '#0a152c',
+  },
+  habitDetailLog: {
+    color: '#c7e2ff',
+    fontSize: 12,
+  },
+  adminPaletteOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(4, 8, 18, 0.85)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 70,
+    padding: 24,
+  },
+  adminPaletteCard: {
+    width: '100%',
+    maxWidth: 520,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#7bc7ff',
+    backgroundColor: '#0c1732',
+    padding: 18,
+    gap: 12,
+  },
+  adminPaletteHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  adminPaletteTitle: {
+    color: '#eaf4ff',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  adminPaletteClose: {
+    color: '#9bb3d6',
+    fontSize: 12,
+  },
+  adminPaletteInput: {
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    color: '#eaf4ff',
+    backgroundColor: '#0a152c',
+  },
+  adminPaletteList: {
+    maxHeight: 220,
+  },
+  adminPaletteItem: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    backgroundColor: '#0a152c',
+    padding: 10,
+    marginBottom: 8,
+  },
+  adminPaletteItemActive: {
+    borderColor: '#7bc7ff',
+    backgroundColor: '#102244',
+  },
+  adminPaletteItemText: {
+    color: '#c7e2ff',
+    fontSize: 12,
+  },
+  adminPaletteParams: {
+    gap: 8,
+  },
+  adminPaletteMessage: {
+    color: '#9fd6ff',
+    fontSize: 12,
+  },
   arcOverlayCard: {
     width: 320,
     borderRadius: 16,
@@ -4555,31 +4747,6 @@ const styles = StyleSheet.create({
     letterSpacing: 4,
     fontWeight: '700',
     marginBottom: 10,
-  },
-  centerTabs: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  centerTab: {
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: '#2f5ca3',
-    backgroundColor: '#0c1b36',
-  },
-  centerTabActive: {
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: '#7bc7ff',
-    backgroundColor: '#143062',
-  },
-  centerTabText: {
-    color: '#c7e2ff',
-    fontSize: FONT.xs,
-    letterSpacing: 1,
   },
   centerScroll: {
     flex: 1,
@@ -4772,6 +4939,106 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     shadowOffset: { width: 0, height: 0 },
   },
+  primaryActionCard: {
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#7bc7ff',
+    backgroundColor: '#0b1a33',
+    padding: 16,
+    marginBottom: 12,
+  },
+  primaryActionLabel: {
+    color: '#9bb3d6',
+    fontSize: 11,
+    letterSpacing: 1.1,
+    textTransform: 'uppercase',
+    marginBottom: 6,
+  },
+  primaryActionTitle: {
+    color: '#eaf4ff',
+    fontSize: 18,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  primaryActionHelper: {
+    color: '#c7e2ff',
+    fontSize: 12,
+    marginBottom: 12,
+  },
+  primaryActionButton: {
+    borderRadius: 10,
+    paddingVertical: 10,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#79d2ff',
+    backgroundColor: '#1e63b8',
+  },
+  primaryActionButtonText: {
+    color: '#eaf4ff',
+    fontWeight: '700',
+    fontSize: 14,
+    letterSpacing: 0.6,
+  },
+  noticeCard: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#2f5ca3',
+    backgroundColor: '#0a152c',
+    padding: 12,
+    marginBottom: 12,
+  },
+  noticeTitle: {
+    color: '#eaf4ff',
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  noticeSubtle: {
+    color: '#9bb3d6',
+    fontSize: 12,
+    marginBottom: 8,
+  },
+  habitListRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 10,
+  },
+  habitCard: {
+    flex: 1,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    backgroundColor: '#0b152a',
+    padding: 12,
+  },
+  habitCardPaused: {
+    opacity: 0.6,
+  },
+  habitCardTitle: {
+    color: '#eaf4ff',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  habitCardMeta: {
+    color: '#9bb3d6',
+    fontSize: 12,
+    marginTop: 4,
+  },
+  habitQuickButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#4ea0ff',
+    backgroundColor: '#12315a',
+  },
+  habitQuickButtonText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+  },
   menuStack: {
     backgroundColor: '#0f1c3b',
     borderRadius: 12,
@@ -4905,6 +5172,56 @@ const styles = StyleSheet.create({
   heroVitals: {
     flexDirection: 'row',
     marginTop: 10,
+  },
+  expRow: {
+    marginTop: 14,
+  },
+  expLabel: {
+    color: '#9bb3d6',
+    fontSize: FONT.sm,
+    letterSpacing: 1.1,
+    textTransform: 'uppercase',
+    marginBottom: 6,
+  },
+  expTrack: {
+    height: 10,
+    borderRadius: 999,
+    backgroundColor: '#0b162d',
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    overflow: 'hidden',
+  },
+  expFill: {
+    height: '100%',
+    backgroundColor: '#6fb0ff',
+  },
+  expToggle: {
+    alignSelf: 'flex-start',
+    marginTop: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    backgroundColor: '#0a152c',
+  },
+  expToggleActive: {
+    borderColor: '#7bc7ff',
+    backgroundColor: '#102244',
+  },
+  expToggleText: {
+    color: '#9bb3d6',
+    fontSize: 11,
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+  },
+  expToggleTextActive: {
+    color: '#eaf4ff',
+  },
+  expNote: {
+    color: '#9fd6ff',
+    fontSize: 12,
+    marginTop: 6,
   },
   heroVitalChip: {
     flexDirection: 'row',
@@ -5139,17 +5456,7 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     fontSize: 14,
   },
-  adminToolsHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 6,
-  },
-  adminToolsMessage: {
-    color: '#ffe4a3',
-    fontSize: FONT.xs,
-    marginBottom: 6,
-  },
+
   panelSubtitle: {
     color: '#ffffff',
     fontSize: FONT.md,
@@ -5158,102 +5465,84 @@ const styles = StyleSheet.create({
     marginBottom: 6,
     letterSpacing: 0.4,
   },
-  adminToolsMetaRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    flexWrap: 'wrap',
-    marginBottom: 8,
-  },
-  adminToolsRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    marginBottom: 8,
-  },
-  adminToolsChip: {
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#2b4a78',
-    backgroundColor: '#0a152c',
-    marginRight: 8,
-    marginBottom: 6,
-  },
-  adminToolsChipActive: {
-    borderColor: ACCENT_GOLD,
-    backgroundColor: '#14234c',
-  },
-  adminToolsChipText: {
-    fontSize: FONT.xs,
-    color: '#c7e2ff',
-    letterSpacing: 0.6,
-  },
-  adminToolsChipTextActive: {
-    color: '#fff7d1',
-  },
-  adminToolsInput: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: '#2b4a78',
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    color: '#eaf4ff',
-    backgroundColor: '#0a152c',
-    marginRight: 8,
-  },
-  adminToolsTextArea: {
-    height: 80,
-    textAlignVertical: 'top',
-    marginRight: 0,
-    flexBasis: '100%',
-  },
-  adminToolsButtonRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginVertical: 12,
-  },
-  adminToolsChest: {
-    borderWidth: 1,
-    borderColor: '#1f335f',
-    borderRadius: 10,
-    padding: 10,
-    backgroundColor: '#08152e',
-    marginBottom: 10,
-  },
-  adminToolsChestHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 6,
-  },
-  adminToolsChestTitle: {
-    color: '#ffe5a6',
-    fontSize: FONT.sm,
-    fontWeight: '700',
-  },
-  adminToolsChestActions: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    marginBottom: 6,
-  },
-  adminToolsRewardRow: {
-    paddingVertical: 4,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderColor: '#1b2b4f',
-  },
-  adminToolsRewardText: {
-    color: '#9fd6ff',
-    fontSize: FONT.xs,
-  },
-  adminToolsNotice: {
-    color: ACCENT_GOLD,
-    fontSize: FONT.sm,
-    marginTop: 6,
-  },
+
   grid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 12,
+  },
+  gallerySeason: {
+    marginTop: 12,
+  },
+  galleryHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    marginBottom: 6,
+  },
+  galleryTitle: {
+    color: '#eaf4ff',
+    fontSize: 14,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+  },
+  galleryTime: {
+    color: '#9bb3d6',
+    fontSize: 11,
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+  },
+  galleryTheme: {
+    color: '#9bb3d6',
+    fontSize: 12,
+    marginBottom: 10,
+  },
+  galleryLocked: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#2b4a78',
+    backgroundColor: '#0a152c',
+    padding: 12,
+    marginBottom: 12,
+  },
+  galleryLockedText: {
+    color: '#9bb3d6',
+    fontSize: 12,
+  },
+  galleryCard: {
+    width: '47%',
+    borderRadius: 14,
+    borderWidth: 1,
+    backgroundColor: '#0a152c',
+    padding: 12,
+    minHeight: 110,
+    justifyContent: 'space-between',
+  },
+  galleryCardUnknown: {
+    backgroundColor: '#0b1528',
+    opacity: 0.9,
+  },
+  gallerySlotIndex: {
+    color: '#9bb3d6',
+    fontSize: 10,
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+  },
+  galleryCardTitle: {
+    color: '#eaf4ff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  galleryCardRarity: {
+    color: '#9fd6ff',
+    fontSize: 11,
+    letterSpacing: 0.6,
+  },
+  galleryCardCount: {
+    color: '#f6c46a',
+    fontSize: 12,
+    fontWeight: '700',
   },
   gridCard: {
     width: '47%',
@@ -5354,50 +5643,11 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
-  adminTabRow: {
-    flexDirection: 'row',
-    gap: 10,
-    marginBottom: 12,
-  },
-  adminTab: {
-    borderWidth: 1,
-    borderColor: '#2b4a78',
-    borderRadius: 10,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    backgroundColor: '#0a152c',
-  },
-  adminTabActive: {
-    borderColor: '#7bc7ff',
-    backgroundColor: '#102244',
-  },
-  adminTabText: {
-    color: '#c7e2ff',
-    fontSize: 12,
-    letterSpacing: 0.6,
-    textTransform: 'uppercase',
-  },
-  adminTabTextActive: {
-    color: '#ffffff',
-    fontWeight: '700',
-  },
+
   adminGrid: {
     gap: 12,
   },
-  adminCard: {
-    borderWidth: 1,
-    borderColor: '#2b4a78',
-    borderRadius: 12,
-    padding: 14,
-    backgroundColor: '#0a152c',
-  },
-  adminCardTitle: {
-    color: '#9fe1ff',
-    fontSize: FONT.sm,
-    letterSpacing: 0.8,
-    textTransform: 'uppercase',
-    marginBottom: 8,
-  },
+
   helpTabRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -5441,3 +5691,4 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
 });
+
