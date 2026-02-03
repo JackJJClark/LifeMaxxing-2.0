@@ -16,7 +16,6 @@ import { supabase, getIsAdmin } from '../services/supabase';
 import RitualOverlay from '../components/RitualOverlay';
 import SlideOverFullScreen from '../components/SlideOverFullScreen';
 import HabitSpaceOverlay from '../components/HabitSpaceOverlay';
-import AdminPanelWeb from '../admin/AdminPanelWeb';
 import {
   signInWithPassword,
   signUpWithPassword,
@@ -82,6 +81,12 @@ import {
   getEquippedCardId,
 } from '../db/db';
 import { SEASON_MANIFEST } from '../data/seasonManifest';
+import {
+  HabitIcon,
+  getHabitActionConfig,
+  getHabitSpec,
+  getHabitTypeFromName,
+} from '../utils/getHabitActionConfig';
 
 const TOP_BAR_HEIGHT = Platform.OS === 'web' ? 80 : 88;
 const BRAND_BOX_SIZE = Platform.OS === 'web' ? 56 : 64;
@@ -359,12 +364,9 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   const [adminPaletteParams, setAdminPaletteParams] = useState({});
   const [habitSpaceOpen, setHabitSpaceOpen] = useState(false);
   const [habitSpaceHabitId, setHabitSpaceHabitId] = useState(null);
-  const [adminPanelOpen, setAdminPanelOpen] = useState(false);
   const [adminSeasonLocks, setAdminSeasonLocks] = useState({});
   const [adminRevealedCards, setAdminRevealedCards] = useState({});
   const [adminPhaseOverride, setAdminPhaseOverride] = useState(null);
-  const [adminTapCount, setAdminTapCount] = useState(0);
-  const [adminTapAt, setAdminTapAt] = useState(0);
   const [equippedCardId, setEquippedCardId] = useState(null);
   const [selectedChallengeHabitId, setSelectedChallengeHabitId] = useState(null);
   const [gallerySelection, setGallerySelection] = useState(null);
@@ -443,18 +445,17 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
 
   async function refreshHabitActionCounts(habitList) {
     const totals = Object.fromEntries(habitList.map((habit) => [habit.id, 0]));
-    const waterHabits = habitList.filter(
-      (habit) => getHabitActionConfig(habit).type === 'water'
-    );
-    if (waterHabits.length === 0) {
+    if (habitList.length === 0) {
       setHabitActionCounts(totals);
       return;
     }
     const entries = await Promise.all(
-      waterHabits.map(async (habit) => [
-        habit.id,
-        await countHabitActionsToday({ habitId: habit.id, actionType: 'water_cup' }),
-      ])
+      habitList.map(async (habit) => {
+        const config = getHabitActionConfig(habit);
+        const actionType = config.actionType || 'custom';
+        const total = await countHabitActionsToday({ habitId: habit.id, actionType });
+        return [habit.id, total];
+      })
     );
     for (const [habitId, total] of entries) {
       totals[habitId] = total;
@@ -817,8 +818,8 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   ]);
   const challengeArcQuest = challengeArcInfo?.quest || null;
   const challengeArcAccepted = challengeArcInfo?.accepted ?? false;
-  const challengeActionConfig = useMemo(
-    () => (challengeHabit ? getHabitActionConfig(challengeHabit) : null),
+  const challengeSpec = useMemo(
+    () => (challengeHabit ? getHabitSpec(challengeHabit) : null),
     [challengeHabit]
   );
   const latestChallengeEffort = useMemo(
@@ -1111,11 +1112,30 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
       return;
     }
     const actionConfig = getHabitActionConfig(targetHabit);
+    const habitSpec = getHabitSpec(targetHabit);
     const resolvedActionType = overrideActionType || actionConfig.actionType || 'custom';
     const resolvedUnits = overrideUnits ?? actionConfig.units ?? 1;
     const noteSource =
       overrideNote !== null && overrideNote !== undefined ? overrideNote : null;
     const cleanedNote = noteSource?.trim ? noteSource.trim() : '';
+    const optimisticTimestamp = new Date().toISOString();
+    setHabitActionCounts((prev) => ({
+      ...prev,
+      [targetHabitId]: (prev[targetHabitId] || 0) + resolvedUnits,
+    }));
+    setEfforts((prev) =>
+      [
+        {
+          id: `optimistic_${optimisticTimestamp}`,
+          habitId: targetHabitId,
+          timestamp: optimisticTimestamp,
+          label: habitSpec?.actions?.[0]?.label || 'Effort',
+          actionType: resolvedActionType,
+          units: resolvedUnits,
+        },
+        ...prev,
+      ].slice(0, 60)
+    );
     const result = await logEffort({
       habitId: targetHabitId,
       note: cleanedNote.length ? cleanedNote : null,
@@ -1159,13 +1179,19 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     }
   }
 
-  async function handleHabitAction(habit) {
+  async function handleHabitAction(habit, action = null) {
     if (!habit || !habit.isActive) return;
     const config = getHabitActionConfig(habit);
+    const spec = getHabitSpec(habit);
+    const resolvedAction = action || spec.actions?.[0];
+    const resolvedUnits =
+      resolvedAction && resolvedAction.type === 'increment'
+        ? resolvedAction.amount || 1
+        : config.units || 1;
     await handleLogEffort({
       habitId: habit.id,
       actionType: config.actionType,
-      units: config.units,
+      units: resolvedUnits,
     });
   }
 
@@ -1894,25 +1920,10 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     const cleaned = name.replace(/^[^\w\s]{1,3}\s+/u, '');
 
     // Provide stable icon for UI only
-    const type = h.type || getHabitTypeFromName(cleaned);
-    const iconEmoji = h.iconEmoji
-      ? String(h.iconEmoji)
-      : habitEmoji(cleaned);
+    const type = getHabitTypeFromName(cleaned, h.type);
+    const iconKey = h.iconKey || '';
 
-    return { ...h, name: cleaned, type, iconEmoji };
-  }
-
-  function habitEmoji(name) {
-    const text = name.toLowerCase();
-    if (text.includes('gym') || text.includes('lift') || text.includes('workout')) return '\u{1F4AA}';
-    if (text.includes('run') || text.includes('cardio')) return '\u{1F3C3}';
-    if (text.includes('water') || text.includes('hydrate')) return '\u{1F4A7}';
-    if (text.includes('sleep') || text.includes('bed')) return '\u{1F634}';
-    if (text.includes('meditate') || text.includes('mind')) return '\u{1F9D8}';
-    if (text.includes('read')) return '\u{1F4DA}';
-    if (text.includes('walk')) return '\u{1F6B6}';
-    if (text.includes('meal') || text.includes('protein') || text.includes('nutrition')) return '\u{1F957}';
-    return '\u{2B50}';
+    return { ...h, name: cleaned, type, iconKey };
   }
 
   async function handleCreateHabit() {
@@ -2472,56 +2483,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
     return Array.from(tags);
   }
 
-  function getHabitTypeFromName(name, explicitType = 'generic') {
-    const hintedType = (explicitType || '').toString().toLowerCase();
-    if (['gym', 'water', 'generic'].includes(hintedType)) {
-      return hintedType;
-    }
-    const text = (name || '').toLowerCase();
-    if (text.includes('water') || text.includes('hydrate') || text.includes('cup')) {
-      return 'water';
-    }
-    if (
-      text.includes('gym') ||
-      text.includes('lift') ||
-      text.includes('train') ||
-      text.includes('workout') ||
-      text.includes('strength')
-    ) {
-      return 'gym';
-    }
-    return 'generic';
-  }
-
-  function getHabitActionConfig(habit) {
-    const type = getHabitTypeFromName(habit?.name, habit?.type);
-    if (type === 'gym') {
-      return {
-        label: 'Log Gym Session',
-        actionType: 'gym_session',
-        units: 1,
-        type,
-        summary: 'Gym session',
-      };
-    }
-    if (type === 'water') {
-      return {
-        label: '+1 cup',
-        actionType: 'water_cup',
-        units: 1,
-        type,
-        summary: 'Hydration cup',
-      };
-    }
-    return {
-      label: 'Log Action',
-      actionType: 'custom',
-      units: 1,
-      type,
-      summary: 'Action',
-    };
-  }
-
   function getIdentityTitle(level) {
     if (level >= 20) return 'Relic-Bound';
     if (level >= 15) return 'Arckeeper';
@@ -2567,15 +2528,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
 
   function handleLogoTap() {
     if (!adminAvailable) return;
-    const now = Date.now();
-    const windowMs = 1500;
-    const nextCount = now - adminTapAt > windowMs ? 1 : adminTapCount + 1;
-    setAdminTapAt(now);
-    setAdminTapCount(nextCount);
-    if (nextCount >= 5) {
-      setAdminTapCount(0);
-      openAdminPanel();
-    }
   }
 
   function openHabitSpace(id) {
@@ -2589,14 +2541,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
   function closeHabitSpace() {
     setHabitSpaceOpen(false);
     setHabitSpaceHabitId(null);
-  }
-
-  function openAdminPanel() {
-    setAdminPanelOpen(true);
-  }
-
-  function closeAdminPanel() {
-    setAdminPanelOpen(false);
   }
 
   const filteredAdminCommands = adminCommands.filter((command) =>
@@ -2872,33 +2816,64 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
             <Text style={styles.panelTitle}>Habits</Text>
             {habits.length === 0 ? (
               <Text style={styles.subtle}>No habits yet. Create one below.</Text>
-            ) : (
-              habits.map((habit) => {
-                const actionConfig = getHabitActionConfig(habit);
-                return (
-                  <View key={habit.id} style={styles.habitListRow}>
-                    <Pressable
-                      style={[
-                        styles.habitCard,
-                        !habit.isActive && styles.habitCardPaused,
-                      ]}
-                      onPress={() => openHabitSpace(habit.id)}
-                    >
-                      <Text style={styles.habitCardTitle}>{habit.name}</Text>
-                      <Text style={styles.habitCardMeta}>
-                        {habit.isActive ? 'Active' : 'Paused'}
-                      </Text>
-                    </Pressable>
-                    <Pressable
-                      style={[styles.habitQuickButton, !habit.isActive && styles.buttonDisabled]}
-                      onPress={() => handleHabitAction(habit)}
-                      disabled={!habit.isActive}
-                    >
-                      <Text style={styles.habitQuickButtonText}>{actionConfig.label}</Text>
-                    </Pressable>
-                  </View>
-                );
-              })
+              ) : (
+                habits.map((habit) => {
+                  const spec = getHabitSpec(habit);
+                  const total = habitActionCounts[habit.id] || 0;
+                  const todayEntry =
+                    spec.template === 'counter_target'
+                      ? { amount: total }
+                      : total > 0
+                      ? { kind: 'done' }
+                      : undefined;
+                  const progressValue = spec.getProgress(todayEntry);
+                  const showCounter = spec.template === 'counter_target';
+                  const target = spec.target || 1;
+                  const primaryAction = spec.actions?.[0];
+                  return (
+                    <View key={habit.id} style={styles.habitListRow}>
+                      <Pressable
+                        style={[
+                          styles.habitCard,
+                          !habit.isActive && styles.habitCardPaused,
+                        ]}
+                        onPress={() => openHabitSpace(habit.id)}
+                      >
+                        <Text style={styles.habitCardTitle}>
+                          <HabitIcon habit={habit} style={styles.habitIconInline} />
+                          {habit.name}
+                        </Text>
+                        <Text style={styles.habitCardMeta}>
+                          {habit.isActive ? 'Active' : 'Paused'}
+                        </Text>
+                        <View style={styles.habitProgressRow}>
+                          <View style={styles.habitProgressTrack}>
+                            <View
+                              style={[
+                                styles.habitProgressFill,
+                                { width: `${Math.round(progressValue * 100)}%` },
+                              ]}
+                            />
+                          </View>
+                          {showCounter ? (
+                            <Text style={styles.habitProgressText}>
+                              {Math.min(total, target)}/{target}
+                            </Text>
+                          ) : null}
+                        </View>
+                      </Pressable>
+                      <Pressable
+                        style={[styles.habitQuickButton, !habit.isActive && styles.buttonDisabled]}
+                        onPress={() => handleHabitAction(habit, primaryAction)}
+                        disabled={!habit.isActive}
+                      >
+                        <Text style={styles.habitQuickButtonText}>
+                          {primaryAction?.label || 'Log'}
+                        </Text>
+                      </Pressable>
+                    </View>
+                  );
+                })
             )}
             <View style={styles.habitInputRow}>
               <TextInput
@@ -3429,29 +3404,39 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
             <>
               <View style={styles.challengeHabitRow}>
                 {habits.map((habit) => (
-                  <Pressable
-                    key={habit.id}
-                    style={[
-                      styles.challengeHabitChip,
-                      selectedChallengeHabitId === habit.id && styles.challengeHabitChipActive,
-                    ]}
-                    onPress={() => openHabitSpace(habit.id)}
-                  >
-                    <Text style={styles.challengeHabitText}>{habit.name}</Text>
-                  </Pressable>
-                ))}
-              </View>
-              {challengeHabit ? (
-                <View style={styles.challengeCard}>
+                    <Pressable
+                      key={habit.id}
+                      style={[
+                        styles.challengeHabitChip,
+                        selectedChallengeHabitId === habit.id && styles.challengeHabitChipActive,
+                      ]}
+                      onPress={() => openHabitSpace(habit.id)}
+                    >
+                      <Text style={styles.challengeHabitText}>
+                        <HabitIcon habit={habit} style={styles.habitIconInline} />
+                        {habit.name}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+                {challengeHabit ? (
+                  <View style={styles.challengeCard}>
                   <View style={styles.challengeCardHeader}>
-                    <View>
-                      <Text style={styles.challengeCardTag}>
-                        {challengeArcQuest ? 'Arc Quest' : 'Habit Journey'}
-                      </Text>
-                      <Text style={styles.challengeCardTitle}>
-                        {challengeArcQuest ? challengeArcQuest.title : challengeHabit.name}
-                      </Text>
-                    </View>
+                      <View>
+                        <Text style={styles.challengeCardTag}>
+                          {challengeArcQuest ? 'Arc Quest' : 'Habit Journey'}
+                        </Text>
+                        <Text style={styles.challengeCardTitle}>
+                          {challengeArcQuest ? (
+                            challengeArcQuest.title
+                          ) : (
+                            <>
+                              <HabitIcon habit={challengeHabit} style={styles.habitIconInline} />
+                              {challengeHabit.name}
+                            </>
+                          )}
+                        </Text>
+                      </View>
                     {challengeArcQuest ? (
                       <Text style={styles.challengeCardScope}>
                         {formatScopeTag(challengeArcQuest.scope)}
@@ -3492,18 +3477,23 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
                         <Text style={styles.challengeAcceptButtonText}>Accept arc quest</Text>
                       </Pressable>
                     ) : null}
-                    <Pressable
-                      style={[
-                        styles.challengeLogButton,
-                        !challengeHabit.isActive && styles.buttonDisabled,
-                      ]}
-                      onPress={() => handleHabitAction(challengeHabit)}
-                      disabled={!challengeHabit.isActive}
-                    >
-                      <Text style={styles.challengeLogButtonText}>
-                        {challengeActionConfig?.label || 'Log action'}
-                      </Text>
-                    </Pressable>
+                      <Pressable
+                        style={[
+                          styles.challengeLogButton,
+                          !challengeHabit.isActive && styles.buttonDisabled,
+                        ]}
+                        onPress={() =>
+                          handleHabitAction(
+                            challengeHabit,
+                            challengeSpec?.actions?.[0]
+                          )
+                        }
+                        disabled={!challengeHabit.isActive}
+                      >
+                        <Text style={styles.challengeLogButtonText}>
+                          {challengeSpec?.actions?.[0]?.label || 'Log'}
+                        </Text>
+                      </Pressable>
                     <Pressable
                       style={[styles.challengeToggleButton]}
                       onPress={() => handleToggleHabit(challengeHabit)}
@@ -3531,16 +3521,19 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
             >
               <Text style={styles.filterText}>All</Text>
             </Pressable>
-            {habits.map((habit) => (
-              <Pressable
-                key={habit.id}
-                style={[styles.filterChip, effortFilter === habit.id && styles.filterChipSelected]}
-                onPress={() => setEffortFilter(habit.id)}
-              >
-                <Text style={styles.filterText}>{habit.name}</Text>
-              </Pressable>
-            ))}
-          </View>
+              {habits.map((habit) => (
+                <Pressable
+                  key={habit.id}
+                  style={[styles.filterChip, effortFilter === habit.id && styles.filterChipSelected]}
+                  onPress={() => setEffortFilter(habit.id)}
+                >
+                  <Text style={styles.filterText}>
+                    <HabitIcon habit={habit} style={styles.habitIconInline} />
+                    {habit.name}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
           {efforts.length === 0 ? (
             <Text style={styles.subtle}>No actions logged yet.</Text>
           ) : (
@@ -3796,38 +3789,23 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
         from="right"
         title="Habit Space"
       >
-        <HabitSpaceOverlay
-          habitId={habitSpaceHabitId}
-          habits={habits}
-          efforts={efforts}
-          arcQuests={arcQuests}
-          onClose={closeHabitSpace}
-          onLog={() => {
-            if (habitDetail) handleHabitAction(habitDetail);
-          }}
-          onRest={() => {
-            setOrientationMessage('Rest tracked soon.');
-          }}
-          onAcceptArc={handleAcceptArcForHabit}
-          onIgnoreArc={handleIgnoreArc}
-        />
+          <HabitSpaceOverlay
+            habitId={habitSpaceHabitId}
+            habits={habits}
+            efforts={efforts}
+            arcQuests={arcQuests}
+            onClose={closeHabitSpace}
+            onLog={(action) => {
+              if (habitDetail) handleHabitAction(habitDetail, action);
+            }}
+            onRest={() => {
+              setOrientationMessage('Rest tracked soon.');
+            }}
+            onAcceptArc={handleAcceptArcForHabit}
+            onIgnoreArc={handleIgnoreArc}
+          />
       </SlideOverFullScreen>
 
-      {adminAvailable ? (
-        <SlideOverFullScreen
-          open={adminPanelOpen}
-          onClose={closeAdminPanel}
-          from="right"
-          title="Admin"
-        >
-          {Platform.OS === 'web' && isAdmin ? (
-            <AdminPanelWeb
-              onClose={closeAdminPanel}
-              onOpenCommandPalette={() => setAdminPaletteOpen(true)}
-            />
-          ) : null}
-        </SlideOverFullScreen>
-      ) : null}
       {showOnboarding ? (
         <View style={styles.onboardingOverlay}>
           <View
@@ -3998,14 +3976,6 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
             </Pressable>
           ))}
         </View>
-        {adminAvailable ? (
-          <Pressable
-            style={styles.adminToolbarButton}
-            onPress={openAdminPanel}
-          >
-            <Text style={styles.adminToolbarButtonText}>Admin</Text>
-          </Pressable>
-        ) : null}
       </View>
 
       {isReady ? (
@@ -4027,14 +3997,15 @@ const [turnstileMessage, setTurnstileMessage] = useState('');
               {habits.filter((habit) => habit.isActive).length === 0 ? (
                 <Text style={styles.sideMeta}>No active habits yet.</Text>
               ) : (
-                habits
-                  .filter((habit) => habit.isActive)
-                  .map((habit) => (
-                    <Text key={habit.id} style={styles.sideMeta}>
-                      - {habit.name}
-                    </Text>
-                  ))
-              )}
+                  habits
+                    .filter((habit) => habit.isActive)
+                    .map((habit) => (
+                      <Text key={habit.id} style={styles.sideMeta}>
+                        - <HabitIcon habit={habit} style={styles.habitIconInline} />
+                        {habit.name}
+                      </Text>
+                    ))
+                )}
               <Text style={styles.sideLabel}>Arc Quests</Text>
               {arcQuests.length === 0 ? (
                 <Text style={styles.sideMeta}>Quiet for now.</Text>
@@ -5160,10 +5131,38 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '700',
   },
+  habitIconInline: {
+    color: '#c7e2ff',
+    fontSize: 13,
+  },
   habitCardMeta: {
     color: '#9bb3d6',
     fontSize: 12,
     marginTop: 4,
+  },
+  habitProgressRow: {
+    marginTop: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  habitProgressTrack: {
+    flex: 1,
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: '#0a152c',
+    borderWidth: 1,
+    borderColor: '#1f3b66',
+    overflow: 'hidden',
+  },
+  habitProgressFill: {
+    height: '100%',
+    backgroundColor: '#8ee3a1',
+  },
+  habitProgressText: {
+    color: '#9ef5c2',
+    fontSize: 11,
+    fontWeight: '700',
   },
   habitQuickButton: {
     paddingVertical: 10,

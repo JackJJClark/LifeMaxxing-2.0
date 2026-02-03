@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Pressable, ScrollView, Text, View } from 'react-native';
+import { HabitIcon, getHabitSpec } from '../utils/getHabitActionConfig';
 
 function startOfDay(d) {
   const x = new Date(d);
@@ -37,6 +38,7 @@ export default function HabitSpaceOverlay({
   onRest,
   onAcceptArc,
   onIgnoreArc,
+  onEdit,
 }) {
   const resolvedHabit = useMemo(() => {
     if (habit) return habit;
@@ -44,6 +46,7 @@ export default function HabitSpaceOverlay({
     return (habits || []).find((h) => h.id === habitId) || null;
   }, [habit, habitId, habits]);
   const [arcOpen, setArcOpen] = useState(false);
+  const [feedback, setFeedback] = useState('');
 
   const scopedArcs = useMemo(() => {
     if (!resolvedHabit) return [];
@@ -58,25 +61,41 @@ export default function HabitSpaceOverlay({
     });
   }, [resolvedHabit, arcQuests]);
 
+  const spec = useMemo(
+    () => (resolvedHabit ? getHabitSpec(resolvedHabit) : null),
+    [resolvedHabit]
+  );
+
   const week = useMemo(() => buildWeek(), []);
 
   const weekMarks = useMemo(() => {
-    if (!resolvedHabit) return {};
+    if (!resolvedHabit || !spec) return {};
     const marks = {};
     for (const d of week) {
       marks[d.toISOString().slice(0, 10)] = null;
     }
 
+    const totalsByDay = {};
     for (const e of efforts || []) {
       if (e.habitId !== resolvedHabit.id) continue;
       const key = String(e.timestamp || '').slice(0, 10);
-      if (!marks[key]) marks[key] = 'done';
-      else marks[key] = 'done';
+      totalsByDay[key] = (totalsByDay[key] || 0) + (e.units || 1);
+    }
+
+    for (const key of Object.keys(marks)) {
+      const total = totalsByDay[key] || 0;
+      const entry =
+        spec.template === 'counter_target'
+          ? { amount: total }
+          : total > 0
+          ? { kind: 'done' }
+          : undefined;
+      marks[key] = spec.getEvidenceKind(entry);
     }
     return marks;
-  }, [resolvedHabit, efforts, week]);
+  }, [resolvedHabit, efforts, week, spec]);
 
-  if (!resolvedHabit) return null;
+  if (!resolvedHabit || !spec) return null;
 
   return (
     <View
@@ -102,7 +121,8 @@ export default function HabitSpaceOverlay({
 
         <View style={{ marginTop: 10 }}>
           <Text style={{ color: 'rgba(255,255,255,0.95)', fontSize: 20 }}>
-            {resolvedHabit.iconEmoji ? `${resolvedHabit.iconEmoji} ` : ''}{resolvedHabit.name}
+            <HabitIcon habit={resolvedHabit} />
+            {resolvedHabit.name}
           </Text>
           <Text style={{ color: 'rgba(255,255,255,0.55)', marginTop: 4 }}>
             A quiet space for this habit.
@@ -178,38 +198,58 @@ export default function HabitSpaceOverlay({
           </Text>
 
           <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}>
-            <Pressable
-              onPress={onLog}
-              style={{
-                flex: 1,
-                paddingVertical: 12,
-                borderRadius: 12,
-                backgroundColor: 'rgba(255,255,255,0.10)',
-                borderWidth: 1,
-                borderColor: 'rgba(255,255,255,0.14)',
-              }}
-            >
-              <Text style={{ color: 'rgba(255,255,255,0.92)', textAlign: 'center' }}>
-                Log
-              </Text>
-            </Pressable>
-
-            <Pressable
-              onPress={onRest}
-              style={{
-                flex: 1,
-                paddingVertical: 12,
-                borderRadius: 12,
-                backgroundColor: 'rgba(255,255,255,0.06)',
-                borderWidth: 1,
-                borderColor: 'rgba(255,255,255,0.14)',
-              }}
-            >
-              <Text style={{ color: 'rgba(255,255,255,0.85)', textAlign: 'center' }}>
-                Rest
-              </Text>
-            </Pressable>
+            {(spec.actions || []).map((action) => {
+              const label = action.label;
+              const handler = () => {
+                if (action.type === 'done' || action.type === 'increment') {
+                  onLog?.(action);
+                  const message =
+                    action.type === 'increment' ? label : 'Logged';
+                  setFeedback(message);
+                  setTimeout(() => setFeedback(''), 1200);
+                  return;
+                }
+                if (action.type === 'rest') {
+                  onRest?.(action);
+                  return;
+                }
+                if (action.type === 'edit') {
+                  onEdit?.(action);
+                }
+              };
+              const isSecondary = action.type === 'rest' || action.type === 'edit';
+              return (
+                <Pressable
+                  key={action.type}
+                  onPress={handler}
+                  style={{
+                    flex: 1,
+                    paddingVertical: 12,
+                    borderRadius: 12,
+                    backgroundColor: isSecondary
+                      ? 'rgba(255,255,255,0.06)'
+                      : 'rgba(255,255,255,0.10)',
+                    borderWidth: 1,
+                    borderColor: 'rgba(255,255,255,0.14)',
+                  }}
+                >
+                  <Text
+                    style={{
+                      color: isSecondary ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.92)',
+                      textAlign: 'center',
+                    }}
+                  >
+                    {label}
+                  </Text>
+                </Pressable>
+              );
+            })}
           </View>
+          {feedback ? (
+            <Text style={{ color: 'rgba(255,255,255,0.65)', marginTop: 10 }}>
+              {feedback}
+            </Text>
+          ) : null}
         </View>
 
         <View style={{ marginTop: 14 }}>
@@ -220,7 +260,11 @@ export default function HabitSpaceOverlay({
           <View style={{ flexDirection: 'row', gap: 8 }}>
             {week.map((d) => {
               const key = d.toISOString().slice(0, 10);
-              const mark = weekMarks[key];
+              const kind = weekMarks[key];
+              let dotColor = 'rgba(255,255,255,0.18)';
+              if (kind === 'done') dotColor = 'rgba(255,255,255,0.85)';
+              if (kind === 'partial') dotColor = 'rgba(255,255,255,0.55)';
+              if (kind === 'rest') dotColor = 'rgba(165,210,255,0.85)';
 
               return (
                 <View
@@ -248,7 +292,7 @@ export default function HabitSpaceOverlay({
                       width: 10,
                       height: 10,
                       borderRadius: 99,
-                      backgroundColor: mark ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.18)',
+                      backgroundColor: dotColor,
                     }}
                   />
                 </View>
